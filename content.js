@@ -47,8 +47,7 @@
   }
 
   function blurElement(el) {
-    const filter = segEnabled ? MAX_BLUR : buildFilter(!blurOff);
-    el.style.setProperty("filter", filter, "important");
+    el.style.setProperty("filter", MAX_BLUR, "important");
     el.style.clipPath = "inset(0)";
   }
 
@@ -75,13 +74,10 @@
   const MAX_BLUR = "blur(20px) grayscale(100%)";
 
   let blurAmount = 0;
-  let hoverOff = true;
   let blurOff = true;
   let grayOn = true;
 
   // --- Person Segmentation ---
-  let segEnabled = true;
-  let segThreshold = 64;
   const segProcessed = new WeakSet();
   const segOriginalSrc = new WeakMap();
   const segMaskCache = new WeakMap();
@@ -118,7 +114,7 @@
     try {
       resp = await bridgeRequest("blurify-segment", { url });
     } catch (e) {
-      // URL fetch failed in offscreen — fall back to sending data URL
+      if (!canvas) throw e;
       const dataUrl = canvas.toDataURL("image/png");
       resp = await bridgeRequest("blurify-segment", { url: dataUrl });
     }
@@ -144,20 +140,30 @@
     return null;
   }
 
+  function markDone(img) {
+    segProcessed.add(img);
+    segMaskCache.set(img, { originalPixels: null, maskAlpha: new Uint8Array(0), w: 0, h: 0 });
+    img.style.setProperty("filter", buildFilter(!blurOff), "important");
+  }
+
   async function processImage(img) {
     if (segProcessed.has(img)) return;
     const imageSrcAttr = img.getAttribute("image-src");
     const src = imageSrcAttr || img.currentSrc || img.src;
     if (!src) return;
-    if (!imageSrcAttr && (img.naturalWidth === 0 || img.naturalHeight === 0)) return;
-    if (!imageSrcAttr && (img.naturalWidth < 16 || img.naturalHeight < 16)) { return; }
+    if (!imageSrcAttr && (img.naturalWidth === 0 || img.naturalHeight === 0)) {
+      img.addEventListener("load", () => enqueueImage(img), { once: true });
+      return;
+    }
+    if (!imageSrcAttr && (img.naturalWidth < 48 || img.naturalHeight < 48)) {
+      markDone(img);
+      return;
+    }
 
     segProcessed.add(img);
 
     if (/\.(svg|gif)(\?|$)/i.test(src) || /^data:image\/(svg|gif)/i.test(src)) {
-      // Skip segmentation but mark as done so it gets normal filter
-      segMaskCache.set(img, { originalPixels: null, maskAlpha: new Uint8Array(0), w: 0, h: 0 });
-      img.style.setProperty("filter", buildFilter(!blurOff), "important");
+      markDone(img);
       return;
     }
     segOriginalSrc.set(img, src);
@@ -169,7 +175,7 @@
       if (segUrlCache.has(fetchUrl)) {
         const cached = segUrlCache.get(fetchUrl);
         segMaskCache.set(img, { originalPixels: cached.originalPixels.slice(), maskAlpha: cached.maskAlpha, w: cached.w, h: cached.h });
-        applySegThreshold(img);
+        applyMask(img);
         return;
       }
 
@@ -201,48 +207,43 @@
       const { maskAlpha, w, h } = await bridgeSegment(fetchUrl, canvas);
 
       // Get original pixels for threshold painting
-      let originalPixels;
-      if (canvas && canvas.width === w && canvas.height === h) {
-        originalPixels = canvas.getContext("2d").getImageData(0, 0, w, h).data.slice();
-      } else if (canvas) {
-        // Resize local canvas to match offscreen dimensions
-        const resized = document.createElement("canvas");
-        resized.width = w;
-        resized.height = h;
-        resized.getContext("2d").drawImage(canvas, 0, 0, w, h);
-        originalPixels = resized.getContext("2d").getImageData(0, 0, w, h).data.slice();
-      } else {
-        // No local pixels — try fetching again for painting
+      if (!canvas) {
         const resp = await crossFetch(fetchUrl);
         const tmp = new Image();
         await new Promise((resolve) => { tmp.onload = resolve; tmp.src = resp; });
         const bmp = await createImageBitmap(tmp);
-        const c = document.createElement("canvas");
-        c.width = w; c.height = h;
-        c.getContext("2d").drawImage(bmp, 0, 0, w, h);
-        originalPixels = c.getContext("2d").getImageData(0, 0, w, h).data.slice();
+        canvas = document.createElement("canvas");
+        canvas.width = bmp.width;
+        canvas.height = bmp.height;
+        canvas.getContext("2d").drawImage(bmp, 0, 0);
       }
+      if (canvas.width !== w || canvas.height !== h) {
+        const resized = document.createElement("canvas");
+        resized.width = w;
+        resized.height = h;
+        resized.getContext("2d").drawImage(canvas, 0, 0, w, h);
+        canvas = resized;
+      }
+      const originalPixels = canvas.getContext("2d").getImageData(0, 0, w, h).data.slice();
 
       const cacheEntry = { originalPixels, maskAlpha, w, h };
       segUrlCache.set(fetchUrl, cacheEntry);
       segMaskCache.set(img, cacheEntry);
-      applySegThreshold(img);
+      applyMask(img);
     } catch (e) {
-      console.warn("[mastir] processImage failed:", e.message);
-      segMaskCache.set(img, { originalPixels: null, maskAlpha: new Uint8Array(0), w: 0, h: 0 });
-      const filter = buildFilter(!blurOff);
-      img.style.setProperty("filter", filter, "important");
+      console.warn("[mastir] processImage failed:", e.message, src?.substring(0, 80));
+      markDone(img);
     }
   }
 
-  function applySegThreshold(img) {
+  function applyMask(img) {
     const cached = segMaskCache.get(img);
     if (!cached || !cached.originalPixels) return;
     const { originalPixels, maskAlpha, w, h } = cached;
     const pixels = originalPixels.slice();
     let didPaint = false;
     for (let i = 0; i < maskAlpha.length; i++) {
-      if (maskAlpha[i] > segThreshold) {
+      if (maskAlpha[i] > 0) {
         const pi = i * 4;
         pixels[pi] = 128; pixels[pi + 1] = 128; pixels[pi + 2] = 128; pixels[pi + 3] = 255;
         didPaint = true;
@@ -274,7 +275,7 @@
 
   const segQueue = [];
   let segActive = 0;
-  const MAX_CONCURRENT = 5;
+  const MAX_CONCURRENT = 3;
 
   async function processQueue() {
     while (segActive < MAX_CONCURRENT && segQueue.length > 0) {
@@ -313,60 +314,22 @@
   const visibilityObserver = new IntersectionObserver((entries) => {
     for (const entry of entries) {
       if (entry.isIntersecting) {
-        prioritizeImage(entry.target);
         visibilityObserver.unobserve(entry.target);
+        enqueueImage(entry.target);
       }
     }
   });
 
-  function isVisible(el) {
-    const rect = el.getBoundingClientRect();
-    return rect.bottom > 0 && rect.top < window.innerHeight && rect.width > 0 && rect.height > 0;
+  function observeImage(img) {
+    if (segProcessed.has(img) || segMaskCache.has(img)) return;
+    visibilityObserver.observe(img);
   }
 
   function runSegmentation() {
-    if (!segEnabled) return;
-    const visible = [];
-    const offscreen = [];
-    document.querySelectorAll("img").forEach((img) => {
-      if (segProcessed.has(img) || segMaskCache.has(img)) return;
-      if (img.naturalWidth > 0 && img.naturalHeight > 0) {
-        (isVisible(img) ? visible : offscreen).push(img);
-      } else if (!img.complete) {
-        img.addEventListener("load", () => { enqueueImage(img); visibilityObserver.observe(img); }, { once: true });
-      }
-    });
-    document.querySelectorAll("[image-src]").forEach((el) => {
-      if (segProcessed.has(el) || segMaskCache.has(el)) return;
-      (isVisible(el) ? visible : offscreen).push(el);
-    });
-    visible.forEach((el) => { enqueueImage(el); visibilityObserver.observe(el); });
-    offscreen.forEach((el) => { enqueueImage(el); visibilityObserver.observe(el); });
+    document.querySelectorAll("img").forEach(observeImage);
+    document.querySelectorAll("[image-src]").forEach(observeImage);
   }
 
-  function restoreImages() {
-    document.querySelectorAll("img").forEach((img) => {
-      if (segOriginalSrc.has(img)) {
-        img.src = segOriginalSrc.get(img);
-      }
-      segProcessed.delete(img);
-    });
-  }
-
-  function toggleSeg() {
-    segEnabled = !segEnabled;
-    updateBtn("toggle_seg", segEnabled, "Seg On", "Seg Off");
-    if (segEnabled) {
-      applyBlur();
-      document.querySelectorAll("img").forEach((img) => {
-        if (segMaskCache.has(img)) applySegThreshold(img);
-      });
-      runSegmentation();
-    } else {
-      restoreImages();
-      applyBlur();
-    }
-  }
 
   // --- UI ---
   function createButton(text, bgColor, borderColor, borderRadius, clickHandler) {
@@ -409,9 +372,6 @@
 
     let collapsed = false;
 
-    const toggleBtn = createButton("Stay Blurred", "#555", "#333", "0", toggleBlur);
-    toggleBtn.id = "toggle_blur";
-
     const sliderWrap = document.createElement("div");
     Object.assign(sliderWrap.style, {
       display: "flex", alignItems: "center", backgroundColor: "#555",
@@ -433,13 +393,10 @@
     });
     sliderWrap.append(slider, sliderLabel);
 
-    const grayBtn = createButton("Gray On", "#555", "#333", "0", toggleGray);
+    const grayBtn = createButton("Gray On", "#555", "#333", "0 10px 10px 0", toggleGray);
     grayBtn.id = "toggle_gray";
 
-    const segBtn = createButton("Seg On", "#555", "#333", "0 10px 10px 0", toggleSeg);
-    segBtn.id = "toggle_seg";
-
-    const extraBtns = [toggleBtn, sliderWrap, grayBtn, segBtn];
+    const extraBtns = [sliderWrap, grayBtn];
 
     const hideBtn = createButton("Hide", "#047c9dff", "#09495bff", "10px 0 0 10px", () => {});
     hideBtn.style.cursor = "grab";
@@ -469,7 +426,7 @@
         const c = collapsed ? "#555" : "#047c9dff";
         hideBtn.dataset.bgColor = c; hideBtn.style.backgroundColor = c;
         hideBtn.style.borderColor = collapsed ? "#333" : "#09495bff";
-        segBtn.style.borderRadius = collapsed ? "" : "0 10px 10px 0";
+        grayBtn.style.borderRadius = collapsed ? "" : "0 10px 10px 0";
       }
     });
 
@@ -490,7 +447,7 @@
     const elements = document.querySelectorAll(BLUR_SELECTOR);
     elements.forEach((img) => {
       const processed = segMaskCache.has(img);
-      const maxBlur = segEnabled && !processed;
+      const maxBlur = !processed;
       const filter = maxBlur ? MAX_BLUR : buildFilter(!blurOff);
       img.style.setProperty("filter", filter, "important");
       img.style.transition = processed ? "filter 0.3s ease" : "none";
@@ -498,30 +455,16 @@
     });
   }
 
-  // Hover handling via document-level delegation (works through overlays)
-  let hoveredImg = null;
+  // Hover prioritization via document-level delegation (works through overlays)
   document.addEventListener("mouseover", (e) => {
     let img = e.target.closest ? e.target.closest(BLUR_SELECTOR) : null;
-    // If no img ancestor, look for an img inside the hovered element or its parent container
     if (!img) {
       const container = e.target.closest ? e.target.closest("[class*='card'], [class*='widget'], [class*='tile'], [data-cel-widget]") : null;
       if (container) img = container.querySelector(BLUR_SELECTOR);
     }
-    if (img === hoveredImg) return;
-    if (hoveredImg) {
-      const processed = segMaskCache.has(hoveredImg);
-      if (processed || !segEnabled) {
-        hoveredImg.style.setProperty("filter", buildFilter(!blurOff), "important");
-      }
-    }
-    hoveredImg = img;
     if (!img) return;
-    const processed = segMaskCache.has(img);
-    const maxBlur = segEnabled && !processed;
-    if (maxBlur) {
+    if (!segMaskCache.has(img)) {
       prioritizeImage(img);
-    } else if (!hoverOff || blurOff) {
-      img.style.setProperty("filter", buildFilter(false), "important");
     }
   });
 
@@ -532,7 +475,7 @@
       if (!blurOff) parts.push(`blur(${blurAmount}px)`);
       if (grayOn) parts.push("grayscale(100%)");
       if (parts.length) {
-        blurStyle.textContent = `img, iframe[src*='youtube'], video, video-js, [image-src], [data-background-image-url] { filter: ${parts.join(" ")} !important; clip-path: inset(0); }`;
+        blurStyle.textContent = `img, iframe[src*='youtube'], video, video-js, [image-src] { filter: ${parts.join(" ")} !important; clip-path: inset(0); }`;
         blurStyle.disabled = false;
       } else {
         blurStyle.disabled = true;
@@ -541,14 +484,13 @@
   }
 
   function broadcastState() {
-    const msg = { type: "blurify-sync", hoverOff, blurOff, grayOn, blurAmount };
+    const msg = { type: "blurify-sync", blurOff, grayOn, blurAmount };
     document.querySelectorAll("iframe").forEach((iframe) => {
       try { iframe.contentWindow.postMessage(msg, "*"); } catch (e) { /* cross-origin */ }
     });
   }
 
   function applyState(state) {
-    hoverOff = state.hoverOff;
     blurOff = state.blurOff;
     grayOn = state.grayOn;
     blurAmount = state.blurAmount;
@@ -556,12 +498,6 @@
     applyBlur();
   }
 
-  function toggleBlur() {
-    hoverOff = !hoverOff;
-    updateBtn("toggle_blur", hoverOff, "Stay Blurred", "Unblur on Hover", "#555", "#d80", "#333", "#a60");
-    applyBlur();
-    broadcastState();
-  }
 
   function toggleGray() {
     grayOn = !grayOn;
@@ -604,7 +540,7 @@
         const cur = img.src || "";
         if (!cur.startsWith("data:") && segMaskCache.has(img)) {
           selfUpdating = true;
-          applySegThreshold(img);
+          applyMask(img);
           selfUpdating = false;
         }
       });
