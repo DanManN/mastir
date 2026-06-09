@@ -9,7 +9,7 @@
     style.id = "blurify-blur-style";
     const existingNonce = document.querySelector("style[nonce], script[nonce]");
     if (existingNonce) style.nonce = existingNonce.nonce || existingNonce.getAttribute("nonce");
-    style.textContent = "img, iframe[src*='youtube'], video, video-js, [image-src], [data-background-image-url] { filter: blur(20px) grayscale(100%) !important; clip-path: inset(0); }";
+    style.textContent = "img, iframe[src*='youtube'], video, video-js, [image-src] { filter: blur(20px) grayscale(100%) !important; clip-path: inset(0); }";
     (document.head || document.documentElement).appendChild(style);
     if (!style.sheet || style.sheet.cssRules.length === 0) {
       style.remove();
@@ -88,13 +88,18 @@
   const segUrlCache = new Map();
 
   // --- Bridge communication ---
-  function bridgeRequest(type, payload) {
+  function bridgeRequest(type, payload, timeoutMs = 10000) {
     return new Promise((resolve, reject) => {
       const id = crypto.randomUUID();
       const responseType = type + "-response";
+      const timer = setTimeout(() => {
+        window.removeEventListener("message", handler);
+        reject(new Error("bridge timeout"));
+      }, timeoutMs);
       function handler(e) {
         if (e.source !== window) return;
         if (e.data?.type !== responseType || e.data.id !== id) return;
+        clearTimeout(timer);
         window.removeEventListener("message", handler);
         if (e.data.error) reject(new Error(e.data.error));
         else resolve(e.data);
@@ -135,7 +140,7 @@
     const imageSrc = el.getAttribute("image-src");
     if (imageSrc) return imageSrc;
     const src = el.currentSrc || el.src;
-    if (src && !src.startsWith("data:") && !src.includes(" ")) return src;
+    if (src && !src.includes(" ")) return src;
     return null;
   }
 
@@ -145,11 +150,11 @@
     const src = imageSrcAttr || img.currentSrc || img.src;
     if (!src) return;
     if (!imageSrcAttr && (img.naturalWidth === 0 || img.naturalHeight === 0)) return;
-    if (!imageSrcAttr && (img.naturalWidth < 16 || img.naturalHeight < 16)) return;
+    if (!imageSrcAttr && (img.naturalWidth < 16 || img.naturalHeight < 16)) { return; }
 
     segProcessed.add(img);
 
-    if (/\.(svg|gif)(\?|$)/i.test(src)) {
+    if (/\.(svg|gif)(\?|$)/i.test(src) || /^data:image\/(svg|gif)/i.test(src)) {
       // Skip segmentation but mark as done so it gets normal filter
       segMaskCache.set(img, { originalPixels: null, maskAlpha: new Uint8Array(0), w: 0, h: 0 });
       img.style.setProperty("filter", buildFilter(!blurOff), "important");
@@ -223,7 +228,7 @@
       segMaskCache.set(img, cacheEntry);
       applySegThreshold(img);
     } catch (e) {
-      console.error("[blurify] processImage failed:", e, src.substring(0, 80));
+      console.warn("[mastir] processImage failed:", e.message);
       segMaskCache.set(img, { originalPixels: null, maskAlpha: new Uint8Array(0), w: 0, h: 0 });
       const filter = buildFilter(!blurOff);
       img.style.setProperty("filter", filter, "important");
@@ -265,34 +270,78 @@
     if (img.tagName === "IMG") observeSrc(img);
   }
 
-  function reapplyAllThresholds() {
-    document.querySelectorAll("img, [image-src]").forEach((el) => {
-      if (segMaskCache.has(el)) applySegThreshold(el);
-    });
+
+
+  const segQueue = [];
+  let segActive = 0;
+  const MAX_CONCURRENT = 5;
+
+  async function processQueue() {
+    while (segActive < MAX_CONCURRENT && segQueue.length > 0) {
+      const img = segQueue.shift();
+      if (segMaskCache.has(img)) continue;
+      segActive++;
+      processImage(img).catch((e) => {
+        console.error("[mastir] queue error:", e);
+      }).finally(() => {
+        segActive--;
+        processQueue();
+      });
+    }
   }
 
-  let segQueue = Promise.resolve();
   function enqueueImage(img) {
+    if (segMaskCache.has(img) || segQueue.includes(img) || segProcessed.has(img)) return;
+    segQueue.push(img);
+    processQueue();
+  }
+
+  function prioritizeImage(img) {
     if (segMaskCache.has(img)) return;
-    segQueue = segQueue.then(() => processImage(img)).catch((e) => {
-      console.error("[blurify] queue error:", e);
-    });
+    const idx = segQueue.indexOf(img);
+    if (idx > 0) {
+      segQueue.splice(idx, 1);
+      segQueue.unshift(img);
+      processQueue();
+    } else if (idx === -1) {
+      segProcessed.delete(img);
+      segQueue.unshift(img);
+      processQueue();
+    }
+  }
+
+  const visibilityObserver = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (entry.isIntersecting) {
+        prioritizeImage(entry.target);
+        visibilityObserver.unobserve(entry.target);
+      }
+    }
+  });
+
+  function isVisible(el) {
+    const rect = el.getBoundingClientRect();
+    return rect.bottom > 0 && rect.top < window.innerHeight && rect.width > 0 && rect.height > 0;
   }
 
   function runSegmentation() {
     if (!segEnabled) return;
+    const visible = [];
+    const offscreen = [];
     document.querySelectorAll("img").forEach((img) => {
       if (segProcessed.has(img) || segMaskCache.has(img)) return;
       if (img.naturalWidth > 0 && img.naturalHeight > 0) {
-        enqueueImage(img);
+        (isVisible(img) ? visible : offscreen).push(img);
       } else if (!img.complete) {
-        img.addEventListener("load", () => enqueueImage(img), { once: true });
+        img.addEventListener("load", () => { enqueueImage(img); visibilityObserver.observe(img); }, { once: true });
       }
     });
     document.querySelectorAll("[image-src]").forEach((el) => {
       if (segProcessed.has(el) || segMaskCache.has(el)) return;
-      enqueueImage(el);
+      (isVisible(el) ? visible : offscreen).push(el);
     });
+    visible.forEach((el) => { enqueueImage(el); visibilityObserver.observe(el); });
+    offscreen.forEach((el) => { enqueueImage(el); visibilityObserver.observe(el); });
   }
 
   function restoreImages() {
@@ -387,28 +436,10 @@
     const grayBtn = createButton("Gray On", "#555", "#333", "0", toggleGray);
     grayBtn.id = "toggle_gray";
 
-    const segBtn = createButton("Seg On", "#555", "#333", "0", toggleSeg);
+    const segBtn = createButton("Seg On", "#555", "#333", "0 10px 10px 0", toggleSeg);
     segBtn.id = "toggle_seg";
 
-    const segSliderWrap = document.createElement("div");
-    Object.assign(segSliderWrap.style, {
-      display: "flex", alignItems: "center", backgroundColor: "#555",
-      border: "2px solid #333", borderRadius: "0 10px 10px 0", padding: "4px 10px", gap: "6px",
-    });
-    const segSliderLabel = document.createElement("span");
-    segSliderLabel.textContent = segThreshold;
-    Object.assign(segSliderLabel.style, { color: "#FFF", fontSize: "12px", minWidth: "20px", textAlign: "center" });
-    const segSlider = document.createElement("input");
-    segSlider.type = "range"; segSlider.min = "0"; segSlider.max = "255"; segSlider.value = String(segThreshold);
-    Object.assign(segSlider.style, { width: "60px", cursor: "pointer" });
-    segSlider.addEventListener("input", () => {
-      segThreshold = parseInt(segSlider.value);
-      segSliderLabel.textContent = segThreshold;
-      if (segEnabled) reapplyAllThresholds();
-    });
-    segSliderWrap.append(segSlider, segSliderLabel);
-
-    const extraBtns = [toggleBtn, sliderWrap, grayBtn, segBtn, segSliderWrap];
+    const extraBtns = [toggleBtn, sliderWrap, grayBtn, segBtn];
 
     const hideBtn = createButton("Hide", "#047c9dff", "#09495bff", "10px 0 0 10px", () => {});
     hideBtn.style.cursor = "grab";
@@ -438,7 +469,7 @@
         const c = collapsed ? "#555" : "#047c9dff";
         hideBtn.dataset.bgColor = c; hideBtn.style.backgroundColor = c;
         hideBtn.style.borderColor = collapsed ? "#333" : "#09495bff";
-        segSliderWrap.style.borderRadius = collapsed ? "" : "0 10px 10px 0";
+        segBtn.style.borderRadius = collapsed ? "" : "0 10px 10px 0";
       }
     });
 
@@ -453,7 +484,7 @@
     return parts.length ? parts.join(" ") : "none";
   }
 
-  const BLUR_SELECTOR = "img, iframe[src*='youtube'], video, [image-src], [data-background-image-url]";
+  const BLUR_SELECTOR = "img, iframe[src*='youtube'], video, [image-src]";
 
   function applyBlur() {
     const elements = document.querySelectorAll(BLUR_SELECTOR);
@@ -464,16 +495,35 @@
       img.style.setProperty("filter", filter, "important");
       img.style.transition = processed ? "filter 0.3s ease" : "none";
       img.style.clipPath = "inset(0)";
-      img.onmouseenter = () => {
-        if (maxBlur) return;
-        img.style.setProperty("filter", (blurOff || !hoverOff) ? buildFilter(false) : buildFilter(true), "important");
-      };
-      img.onmouseleave = () => {
-        if (maxBlur) return;
-        img.style.setProperty("filter", buildFilter(!blurOff), "important");
-      };
     });
   }
+
+  // Hover handling via document-level delegation (works through overlays)
+  let hoveredImg = null;
+  document.addEventListener("mouseover", (e) => {
+    let img = e.target.closest ? e.target.closest(BLUR_SELECTOR) : null;
+    // If no img ancestor, look for an img inside the hovered element or its parent container
+    if (!img) {
+      const container = e.target.closest ? e.target.closest("[class*='card'], [class*='widget'], [class*='tile'], [data-cel-widget]") : null;
+      if (container) img = container.querySelector(BLUR_SELECTOR);
+    }
+    if (img === hoveredImg) return;
+    if (hoveredImg) {
+      const processed = segMaskCache.has(hoveredImg);
+      if (processed || !segEnabled) {
+        hoveredImg.style.setProperty("filter", buildFilter(!blurOff), "important");
+      }
+    }
+    hoveredImg = img;
+    if (!img) return;
+    const processed = segMaskCache.has(img);
+    const maxBlur = segEnabled && !processed;
+    if (maxBlur) {
+      prioritizeImage(img);
+    } else if (!hoverOff || blurOff) {
+      img.style.setProperty("filter", buildFilter(false), "important");
+    }
+  });
 
   function updateStyleRule() {
     const blurStyle = document.getElementById("blurify-blur-style");
