@@ -116,7 +116,6 @@
       bundledModelUrl = e.data.modelUrl;
       bundledVisionUrl = e.data.visionUrl;
       bundledWasmUrl = e.data.wasmUrl;
-      loadSegmenter();
     }
   });
 
@@ -129,31 +128,22 @@
         vision = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0/vision_bundle.mjs");
         wasmBase = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0/wasm";
       } catch (e) {
-        if (bundledVisionUrl) {
-          vision = await import(bundledVisionUrl);
-          wasmBase = bundledWasmUrl;
-        } else {
-          segLoading = null;
-          throw e;
-        }
+        if (!bundledVisionUrl) { segLoading = null; throw e; }
+        vision = await import(bundledVisionUrl);
+        wasmBase = bundledWasmUrl;
       }
-      try {
-        const wasmFiles = await vision.FilesetResolver.forVisionTasks(wasmBase);
-        segmenter = await vision.ImageSegmenter.createFromOptions(wasmFiles, {
-          baseOptions: {
-            modelAssetPath: bundledModelUrl || "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite",
-            delegate: "GPU",
-          },
-          runningMode: "IMAGE",
-          outputCategoryMask: true,
-          outputConfidenceMasks: false,
-        });
-        return segmenter;
-      } catch (e) {
-        segLoading = null;
-        throw e;
-      }
-    })();
+      const wasmFiles = await vision.FilesetResolver.forVisionTasks(wasmBase);
+      segmenter = await vision.ImageSegmenter.createFromOptions(wasmFiles, {
+        baseOptions: {
+          modelAssetPath: bundledModelUrl || "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite",
+          delegate: "GPU",
+        },
+        runningMode: "IMAGE",
+        outputCategoryMask: true,
+        outputConfidenceMasks: false,
+      });
+      return segmenter;
+    })().catch((e) => { segLoading = null; throw e; });
     return segLoading;
   }
 
