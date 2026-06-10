@@ -104,6 +104,56 @@
     return bridgeRequest("blurify-fetch", { url }).then((r) => r.dataUrl);
   }
 
+  // --- Local GPU segmenter (CDN import, falls back to offscreen CPU) ---
+  let localSegmenter = null;
+  let localSegFailed = false;
+  let localSegLoading = null;
+
+  function loadLocalSegmenter() {
+    if (localSegFailed) return Promise.resolve(null);
+    if (localSegmenter) return Promise.resolve(localSegmenter);
+    if (localSegLoading) return localSegLoading;
+    localSegLoading = (async () => {
+      try {
+        const vision = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0/vision_bundle.mjs");
+        const wasmFiles = await vision.FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0/wasm"
+        );
+        localSegmenter = await vision.ImageSegmenter.createFromOptions(wasmFiles, {
+          baseOptions: {
+            modelAssetPath: "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite",
+            delegate: "GPU",
+          },
+          runningMode: "IMAGE",
+          outputCategoryMask: true,
+          outputConfidenceMasks: false,
+        });
+        return localSegmenter;
+      } catch (e) {
+        localSegFailed = true;
+        return null;
+      }
+    })();
+    return localSegLoading;
+  }
+
+  async function localSegment(canvas) {
+    const seg = await loadLocalSegmenter();
+    if (!seg) return null;
+    const result = seg.segment(canvas);
+    const mask = result.categoryMask;
+    const w = canvas.width, h = canvas.height;
+    const maskAlpha = new Uint8Array(w * h);
+    if (mask) {
+      const maskData = mask.getAsUint8Array();
+      for (let i = 0; i < maskData.length; i++) {
+        maskAlpha[i] = maskData[i] > 0 ? 255 : 0;
+      }
+      result.close();
+    }
+    return { maskAlpha, w, h };
+  }
+
   async function bridgeSegment(url, canvas) {
     let resp;
     try {
@@ -113,7 +163,6 @@
       const dataUrl = canvas.toDataURL("image/png");
       resp = await bridgeRequest("blurify-segment", { url: dataUrl });
     }
-    // Decode base64 mask
     const binary = atob(resp.maskBase64);
     const maskAlpha = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) {
@@ -121,6 +170,17 @@
     }
     return { maskAlpha, w: resp.w, h: resp.h };
   }
+
+  async function segment(fetchUrl, canvas) {
+    if (canvas && !localSegFailed) {
+      const result = await localSegment(canvas);
+      if (result) return result;
+    }
+    return bridgeSegment(fetchUrl, canvas);
+  }
+
+  // Start loading segmenter immediately
+  loadLocalSegmenter();
 
   function getImageUrl(el) {
     const srcset = el.getAttribute("srcset");
@@ -209,7 +269,7 @@
         // Can't get pixels locally — offscreen will fetch directly
       }
 
-      const { maskAlpha, w, h } = await bridgeSegment(fetchUrl, canvas);
+      const { maskAlpha, w, h } = await segment(fetchUrl, canvas);
 
       // Get original pixels for threshold painting
       if (!canvas) {
@@ -285,21 +345,21 @@
 
 
   const segQueue = [];
-  let segActive = 0;
-  const MAX_CONCURRENT = 3;
+  let segRunning = false;
 
   async function processQueue() {
-    while (segActive < MAX_CONCURRENT && segQueue.length > 0) {
+    if (segRunning) return;
+    segRunning = true;
+    while (segQueue.length > 0) {
       const img = segQueue.shift();
       if (segMaskCache.has(img)) continue;
-      segActive++;
-      processImage(img).catch((e) => {
+      try {
+        await processImage(img);
+      } catch (e) {
         console.error("[mastir] queue error:", e);
-      }).finally(() => {
-        segActive--;
-        processQueue();
-      });
+      }
     }
+    segRunning = false;
   }
 
   function enqueueImage(img) {
