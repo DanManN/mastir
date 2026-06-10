@@ -104,64 +104,78 @@
     return bridgeRequest("mastir-fetch", { url }).then((r) => r.dataUrl);
   }
 
-  // --- Local GPU segmenter (local bundle → CDN → offscreen CPU) ---
-  let localSegmenter = null;
-  let localSegFailed = false;
-  let localSegLoading = null;
-  let extensionBaseUrl = null;
+  // --- GPU segmenter (CDN → bundled fallback) ---
+  let segmenter = null;
+  let segLoading = null;
+  let bundledVisionUrl = null;
+  let bundledWasmUrl = null;
+  let bundledModelUrl = null;
 
   window.addEventListener("message", (e) => {
-    if (e.source === window && e.data?.type === "mastir-extension-url") {
-      extensionBaseUrl = e.data.baseUrl;
-      loadLocalSegmenter();
+    if (e.source === window && e.data?.type === "mastir-extension-urls") {
+      bundledModelUrl = e.data.modelUrl;
+      bundledVisionUrl = e.data.visionUrl;
+      bundledWasmUrl = e.data.wasmUrl;
+      loadSegmenter();
     }
   });
 
-  function loadLocalSegmenter() {
-    if (localSegFailed) return Promise.resolve(null);
-    if (localSegmenter) return Promise.resolve(localSegmenter);
-    if (localSegLoading) return localSegLoading;
-    localSegLoading = (async () => {
+  function loadSegmenter() {
+    if (segmenter) return Promise.resolve(segmenter);
+    if (segLoading) return segLoading;
+    segLoading = (async () => {
       let vision, wasmBase;
-      if (extensionBaseUrl) {
-        try {
-          vision = await import(extensionBaseUrl + "vision_bundle.mjs");
-          wasmBase = extensionBaseUrl + "wasm";
-        } catch (e) { /* CSP blocked local — try CDN */ }
-      }
-      if (!vision) {
-        try {
-          vision = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0/vision_bundle.mjs");
-          wasmBase = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0/wasm";
-        } catch (e) {
-          localSegFailed = true;
-          return null;
+      try {
+        vision = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0/vision_bundle.mjs");
+        wasmBase = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0/wasm";
+      } catch (e) {
+        if (bundledVisionUrl) {
+          vision = await import(bundledVisionUrl);
+          wasmBase = bundledWasmUrl;
+        } else {
+          segLoading = null;
+          throw e;
         }
       }
       try {
         const wasmFiles = await vision.FilesetResolver.forVisionTasks(wasmBase);
-        localSegmenter = await vision.ImageSegmenter.createFromOptions(wasmFiles, {
+        segmenter = await vision.ImageSegmenter.createFromOptions(wasmFiles, {
           baseOptions: {
-            modelAssetPath: "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite",
+            modelAssetPath: bundledModelUrl || "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite",
             delegate: "GPU",
           },
           runningMode: "IMAGE",
           outputCategoryMask: true,
           outputConfidenceMasks: false,
         });
-        return localSegmenter;
+        return segmenter;
       } catch (e) {
-        localSegFailed = true;
-        return null;
+        segLoading = null;
+        throw e;
       }
     })();
-    return localSegLoading;
+    return segLoading;
   }
 
-  async function localSegment(canvas) {
-    const seg = await loadLocalSegmenter();
-    if (!seg) return null;
-    const result = seg.segment(canvas);
+  function waitForBody() {
+    if (document.body) return Promise.resolve();
+    return new Promise((resolve) => {
+      const check = () => document.body ? resolve() : requestAnimationFrame(check);
+      check();
+    });
+  }
+
+  async function segment(canvas) {
+    await waitForBody();
+    const seg = await loadSegmenter();
+    if (!seg) throw new Error("segmenter unavailable");
+    let result;
+    try {
+      result = seg.segment(canvas);
+    } catch (e) {
+      await waitForBody();
+      result = seg.segment(canvas);
+    }
     const mask = result.categoryMask;
     const w = canvas.width, h = canvas.height;
     const maskAlpha = new Uint8Array(w * h);
@@ -175,29 +189,11 @@
     return { maskAlpha, w, h };
   }
 
-  async function bridgeSegment(url, canvas) {
-    let resp;
-    try {
-      resp = await bridgeRequest("mastir-segment", { url });
-    } catch (e) {
-      if (!canvas) throw e;
-      const dataUrl = canvas.toDataURL("image/png");
-      resp = await bridgeRequest("mastir-segment", { url: dataUrl });
-    }
-    const binary = atob(resp.maskBase64);
-    const maskAlpha = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-      maskAlpha[i] = binary.charCodeAt(i);
-    }
-    return { maskAlpha, w: resp.w, h: resp.h };
-  }
-
-  async function segment(fetchUrl, canvas) {
-    if (canvas && !localSegFailed) {
-      const result = await localSegment(canvas);
-      if (result) return result;
-    }
-    return bridgeSegment(fetchUrl, canvas);
+  // Load segmenter as soon as DOM is ready (MediaPipe needs document.body)
+  if (document.body) {
+    loadSegmenter();
+  } else {
+    document.addEventListener("DOMContentLoaded", () => loadSegmenter(), { once: true });
   }
 
   function getImageUrl(el) {
@@ -262,51 +258,26 @@
         return;
       }
 
-      // Try to get a local canvas for fallback data URL
-      let canvas = null;
-      try {
-        const bitmap = await new Promise((resolve, reject) => {
-          const tmp = new Image();
-          tmp.crossOrigin = "anonymous";
-          tmp.onload = () => resolve(createImageBitmap(tmp));
-          tmp.onerror = () => {
-            crossFetch(fetchUrl).then((dataUrl) => {
-              const tmp2 = new Image();
-              tmp2.onload = () => resolve(createImageBitmap(tmp2));
-              tmp2.onerror = () => reject(new Error("decode failed"));
-              tmp2.src = dataUrl;
-            }).catch(reject);
-          };
-          tmp.src = fetchUrl;
-        });
-        canvas = document.createElement("canvas");
-        canvas.width = bitmap.width;
-        canvas.height = bitmap.height;
-        canvas.getContext("2d").drawImage(bitmap, 0, 0);
-      } catch (e) {
-        // Can't get pixels locally — offscreen will fetch directly
-      }
-
-      const { maskAlpha, w, h } = await segment(fetchUrl, canvas);
-
-      // Get original pixels for threshold painting
-      if (!canvas) {
-        const resp = await crossFetch(fetchUrl);
+      const bitmap = await new Promise((resolve, reject) => {
         const tmp = new Image();
-        await new Promise((resolve) => { tmp.onload = resolve; tmp.src = resp; });
-        const bmp = await createImageBitmap(tmp);
-        canvas = document.createElement("canvas");
-        canvas.width = bmp.width;
-        canvas.height = bmp.height;
-        canvas.getContext("2d").drawImage(bmp, 0, 0);
-      }
-      if (canvas.width !== w || canvas.height !== h) {
-        const resized = document.createElement("canvas");
-        resized.width = w;
-        resized.height = h;
-        resized.getContext("2d").drawImage(canvas, 0, 0, w, h);
-        canvas = resized;
-      }
+        tmp.crossOrigin = "anonymous";
+        tmp.onload = () => resolve(createImageBitmap(tmp));
+        tmp.onerror = () => {
+          crossFetch(fetchUrl).then((dataUrl) => {
+            const tmp2 = new Image();
+            tmp2.onload = () => resolve(createImageBitmap(tmp2));
+            tmp2.onerror = () => reject(new Error("decode failed"));
+            tmp2.src = dataUrl;
+          }).catch(reject);
+        };
+        tmp.src = fetchUrl;
+      });
+      const canvas = document.createElement("canvas");
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+      canvas.getContext("2d").drawImage(bitmap, 0, 0);
+
+      const { maskAlpha, w, h } = await segment(canvas);
       const originalPixels = canvas.getContext("2d").getImageData(0, 0, w, h).data.slice();
 
       const cacheEntry = { originalPixels, maskAlpha, w, h };
@@ -316,7 +287,12 @@
       applyMask(img);
     } catch (e) {
       console.warn("[mastir] processImage failed:", e.message, src?.substring(0, 80));
-      markDone(img);
+      segProcessed.delete(img);
+      const retries = (img.__mastirRetries || 0) + 1;
+      img.__mastirRetries = retries;
+      if (retries <= 5) {
+        setTimeout(() => enqueueImage(img), retries * 2000);
+      }
     }
   }
 
