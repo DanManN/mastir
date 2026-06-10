@@ -9,7 +9,7 @@
     style.id = "blurify-blur-style";
     const existingNonce = document.querySelector("style[nonce], script[nonce]");
     if (existingNonce) style.nonce = existingNonce.nonce || existingNonce.getAttribute("nonce");
-    style.textContent = "img, iframe[src*='youtube'], video, video-js, [image-src] { filter: blur(20px) grayscale(100%) !important; clip-path: inset(0); }";
+    style.textContent = "img, video, video-js, [image-src] { filter: blur(20px) grayscale(100%) !important; clip-path: inset(0); }";
     (document.head || document.documentElement).appendChild(style);
     if (!style.sheet || style.sheet.cssRules.length === 0) {
       style.remove();
@@ -27,8 +27,16 @@
 
   const BG_IMG_RE = /url\(["']?([^"')]*\.(jpe?g|png|gif|webp|avif|bmp)(\?[^"')]*)?|data:image\/[^"')]+)["']?\)/i;
 
+  function isVideoIframe(el) {
+    if (el.tagName !== "IFRAME") return false;
+    if (el.hasAttribute("allowfullscreen")) return true;
+    const allow = el.getAttribute("allow") || "";
+    return /picture-in-picture|encrypted-media|autoplay/.test(allow);
+  }
+
   function shouldPreBlur(el) {
     if (el.hasAttribute && el.hasAttribute("image-src")) return true;
+    if (isVideoIframe(el)) return true;
     const style = el.getAttribute("style");
     if (style && BG_IMG_RE.test(style)) return true;
     return false;
@@ -67,6 +75,7 @@
   const segProcessed = new WeakSet();
   const segOriginalSrc = new WeakMap();
   const segMaskCache = new WeakMap();
+  const segAllElements = new Set();
   const segUrlCache = new Map();
 
   // --- Bridge communication ---
@@ -134,11 +143,13 @@
   function markDone(img) {
     segProcessed.add(img);
     segMaskCache.set(img, { originalPixels: null, maskAlpha: new Uint8Array(0), w: 0, h: 0 });
+    segAllElements.add(img);
     img.style.setProperty("filter", buildFilter(!blurOff), "important");
   }
 
   async function processImage(img) {
     if (segProcessed.has(img)) return;
+    if (isVideoIframe(img)) { segProcessed.add(img); return; }
     const imageSrcAttr = img.getAttribute("image-src");
     const src = imageSrcAttr || img.currentSrc || img.src || getImageUrl(img);
     if (!src) return;
@@ -168,6 +179,7 @@
       if (segUrlCache.has(fetchUrl)) {
         const cached = segUrlCache.get(fetchUrl);
         segMaskCache.set(img, { originalPixels: cached.originalPixels.slice(), maskAlpha: cached.maskAlpha, w: cached.w, h: cached.h });
+        segAllElements.add(img);
         applyMask(img);
         return;
       }
@@ -222,6 +234,7 @@
       const cacheEntry = { originalPixels, maskAlpha, w, h };
       segUrlCache.set(fetchUrl, cacheEntry);
       segMaskCache.set(img, cacheEntry);
+      segAllElements.add(img);
       applyMask(img);
     } catch (e) {
       console.warn("[mastir] processImage failed:", e.message, src?.substring(0, 80));
@@ -295,19 +308,6 @@
     processQueue();
   }
 
-  function prioritizeImage(img) {
-    if (segMaskCache.has(img)) return;
-    const idx = segQueue.indexOf(img);
-    if (idx > 0) {
-      segQueue.splice(idx, 1);
-      segQueue.unshift(img);
-      processQueue();
-    } else if (idx === -1) {
-      segProcessed.delete(img);
-      segQueue.unshift(img);
-      processQueue();
-    }
-  }
 
   const SKIP_BG_TAGS = new Set(["SCRIPT", "STYLE", "LINK", "META", "BR", "HR", "INPUT", "TEXTAREA", "SELECT", "BUTTON", "SVG", "PATH", "IMG"]);
 
@@ -456,32 +456,12 @@
     return parts.length ? parts.join(" ") : "none";
   }
 
-  const BLUR_SELECTOR = "img, iframe[src*='youtube'], video, [image-src]";
-
   function applyBlur() {
-    const elements = document.querySelectorAll(BLUR_SELECTOR);
-    elements.forEach((img) => {
-      const processed = segMaskCache.has(img);
-      const maxBlur = !processed;
-      const filter = maxBlur ? MAX_BLUR : buildFilter(!blurOff);
-      img.style.setProperty("filter", filter, "important");
-      img.style.transition = processed ? "filter 0.3s ease" : "none";
-      img.style.clipPath = "inset(0)";
+    segAllElements.forEach((el) => {
+      el.style.setProperty("filter", buildFilter(!blurOff), "important");
     });
   }
 
-  // Hover prioritization via document-level delegation (works through overlays)
-  document.addEventListener("mouseover", (e) => {
-    let img = e.target.closest ? e.target.closest(BLUR_SELECTOR) : null;
-    if (!img) {
-      const container = e.target.closest ? e.target.closest("[class*='card'], [class*='widget'], [class*='tile'], [data-cel-widget]") : null;
-      if (container) img = container.querySelector(BLUR_SELECTOR);
-    }
-    if (!img) return;
-    if (!segMaskCache.has(img)) {
-      prioritizeImage(img);
-    }
-  });
 
   function updateStyleRule() {
     const blurStyle = document.getElementById("blurify-blur-style");
@@ -490,7 +470,7 @@
       if (!blurOff) parts.push(`blur(${blurAmount}px)`);
       if (grayOn) parts.push("grayscale(100%)");
       if (parts.length) {
-        blurStyle.textContent = `img, iframe[src*='youtube'], video, video-js, [image-src] { filter: ${parts.join(" ")} !important; clip-path: inset(0); }`;
+        blurStyle.textContent = `img, video, video-js, [image-src] { filter: ${parts.join(" ")} !important; clip-path: inset(0); }`;
         blurStyle.disabled = false;
       } else {
         blurStyle.disabled = true;
