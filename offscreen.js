@@ -21,7 +21,7 @@ async function loadSegmenter() {
       });
       return segmenter;
     } catch (e) {
-      console.error("[blurify offscreen] segmenter init failed:", e);
+      console.error("[mastir offscreen] segmenter init failed:", e);
       segmenter = false;
       return false;
     }

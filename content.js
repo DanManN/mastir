@@ -6,7 +6,7 @@
   function tryInjectStyle() {
     if (styleInjected) return;
     const style = document.createElement("style");
-    style.id = "blurify-blur-style";
+    style.id = "mastir-blur-style";
     const existingNonce = document.querySelector("style[nonce], script[nonce]");
     if (existingNonce) style.nonce = existingNonce.nonce || existingNonce.getAttribute("nonce");
     style.textContent = "img, video, video-js, [image-src] { filter: blur(20px) grayscale(100%) !important; clip-path: inset(0); }";
@@ -101,24 +101,45 @@
   }
 
   function crossFetch(url) {
-    return bridgeRequest("blurify-fetch", { url }).then((r) => r.dataUrl);
+    return bridgeRequest("mastir-fetch", { url }).then((r) => r.dataUrl);
   }
 
-  // --- Local GPU segmenter (CDN import, falls back to offscreen CPU) ---
+  // --- Local GPU segmenter (local bundle → CDN → offscreen CPU) ---
   let localSegmenter = null;
   let localSegFailed = false;
   let localSegLoading = null;
+  let extensionBaseUrl = null;
+
+  window.addEventListener("message", (e) => {
+    if (e.source === window && e.data?.type === "mastir-extension-url") {
+      extensionBaseUrl = e.data.baseUrl;
+      loadLocalSegmenter();
+    }
+  });
 
   function loadLocalSegmenter() {
     if (localSegFailed) return Promise.resolve(null);
     if (localSegmenter) return Promise.resolve(localSegmenter);
     if (localSegLoading) return localSegLoading;
     localSegLoading = (async () => {
+      let vision, wasmBase;
+      if (extensionBaseUrl) {
+        try {
+          vision = await import(extensionBaseUrl + "vision_bundle.mjs");
+          wasmBase = extensionBaseUrl + "wasm";
+        } catch (e) { /* CSP blocked local — try CDN */ }
+      }
+      if (!vision) {
+        try {
+          vision = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0/vision_bundle.mjs");
+          wasmBase = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0/wasm";
+        } catch (e) {
+          localSegFailed = true;
+          return null;
+        }
+      }
       try {
-        const vision = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0/vision_bundle.mjs");
-        const wasmFiles = await vision.FilesetResolver.forVisionTasks(
-          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0/wasm"
-        );
+        const wasmFiles = await vision.FilesetResolver.forVisionTasks(wasmBase);
         localSegmenter = await vision.ImageSegmenter.createFromOptions(wasmFiles, {
           baseOptions: {
             modelAssetPath: "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite",
@@ -157,11 +178,11 @@
   async function bridgeSegment(url, canvas) {
     let resp;
     try {
-      resp = await bridgeRequest("blurify-segment", { url });
+      resp = await bridgeRequest("mastir-segment", { url });
     } catch (e) {
       if (!canvas) throw e;
       const dataUrl = canvas.toDataURL("image/png");
-      resp = await bridgeRequest("blurify-segment", { url: dataUrl });
+      resp = await bridgeRequest("mastir-segment", { url: dataUrl });
     }
     const binary = atob(resp.maskBase64);
     const maskAlpha = new Uint8Array(binary.length);
@@ -178,9 +199,6 @@
     }
     return bridgeSegment(fetchUrl, canvas);
   }
-
-  // Start loading segmenter immediately
-  loadLocalSegmenter();
 
   function getImageUrl(el) {
     const srcset = el.getAttribute("srcset");
@@ -453,7 +471,7 @@
 
   function createToggleButton() {
     const container = document.createElement("div");
-    container.id = "blurify-controls";
+    container.id = "mastir-controls";
     Object.assign(container.style, {
       position: "fixed", bottom: "25px", left: "25px", zIndex: "9999",
       display: "flex", userSelect: "none",
@@ -538,7 +556,7 @@
 
 
   function broadcastState() {
-    const msg = { type: "blurify-sync", blurOff, grayOn, blurAmount };
+    const msg = { type: "mastir-sync", blurOff, grayOn, blurAmount };
     document.querySelectorAll("iframe").forEach((iframe) => {
       try { iframe.contentWindow.postMessage(msg, "*"); } catch (e) { /* cross-origin */ }
     });
@@ -562,7 +580,7 @@
   }
 
   window.addEventListener("message", (e) => {
-    if (e.data && e.data.type === "blurify-sync") {
+    if (e.data && e.data.type === "mastir-sync") {
       applyState(e.data);
       broadcastState();
     }
@@ -614,7 +632,7 @@
         segDebounce = setTimeout(() => { segDebounce = null; runSegmentation(); }, 500);
       }
     }).observe(document.body, { childList: true, subtree: true });
-    if (window === window.top && !document.getElementById("blurify-controls")) {
+    if (window === window.top && !document.getElementById("mastir-controls")) {
       createToggleButton();
     }
     applyBlur();
