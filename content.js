@@ -307,12 +307,26 @@
     if (!cached || !cached.originalPixels) return;
     const { originalPixels, maskAlpha, w, h } = cached;
     const pixels = originalPixels.slice();
-    let didPaint = false;
+    let rSum = 0, gSum = 0, bSum = 0, count = 0;
     for (let i = 0; i < maskAlpha.length; i++) {
       if (maskAlpha[i] > 0) {
         const pi = i * 4;
-        pixels[pi] = 128; pixels[pi + 1] = 128; pixels[pi + 2] = 128; pixels[pi + 3] = 255;
-        didPaint = true;
+        rSum += originalPixels[pi];
+        gSum += originalPixels[pi + 1];
+        bSum += originalPixels[pi + 2];
+        count++;
+      }
+    }
+    const didPaint = count > 0;
+    if (didPaint) {
+      const r = (rSum / count) | 0;
+      const g = (gSum / count) | 0;
+      const b = (bSum / count) | 0;
+      for (let i = 0; i < maskAlpha.length; i++) {
+        if (maskAlpha[i] > 0) {
+          const pi = i * 4;
+          pixels[pi] = r; pixels[pi + 1] = g; pixels[pi + 2] = b; pixels[pi + 3] = 255;
+        }
       }
     }
     if (didPaint) {
@@ -462,7 +476,6 @@
       blurAmount = parseInt(slider.value);
       sliderLabel.textContent = blurAmount;
       blurOff = blurAmount === 0;
-      updateStyleRule();
       applyBlur();
       broadcastState();
     });
@@ -523,20 +536,6 @@
   }
 
 
-  function updateStyleRule() {
-    const blurStyle = document.getElementById("blurify-blur-style");
-    if (blurStyle) {
-      const parts = [];
-      if (!blurOff) parts.push(`blur(${blurAmount}px)`);
-      if (grayOn) parts.push("grayscale(100%)");
-      if (parts.length) {
-        blurStyle.textContent = `img, video, video-js, [image-src] { filter: ${parts.join(" ")} !important; clip-path: inset(0); }`;
-        blurStyle.disabled = false;
-      } else {
-        blurStyle.disabled = true;
-      }
-    }
-  }
 
   function broadcastState() {
     const msg = { type: "blurify-sync", blurOff, grayOn, blurAmount };
@@ -549,14 +548,14 @@
     blurOff = state.blurOff;
     grayOn = state.grayOn;
     blurAmount = state.blurAmount;
-    updateStyleRule();
+    applyBlur();
     applyBlur();
   }
 
 
   function toggleGray() {
     grayOn = !grayOn;
-    updateStyleRule();
+    applyBlur();
     updateBtn("toggle_gray", grayOn, "Gray On", "Gray Off");
     applyBlur();
     broadcastState();
