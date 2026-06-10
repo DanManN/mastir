@@ -25,25 +25,13 @@
     }).observe(document.documentElement, { childList: true, subtree: true });
   }
 
-  const IMG_EXT_RE = /\.(jpe?g|png|gif|webp|svg|avif|bmp|ico)(\?|$)/i;
   const BG_IMG_RE = /url\(["']?([^"')]*\.(jpe?g|png|gif|webp|avif|bmp)(\?[^"')]*)?|data:image\/[^"')]+)["']?\)/i;
 
-  function isImageCustomElement(el) {
-    if (!el.tagName || !el.tagName.includes("-")) return false;
-    const attrs = el.attributes;
-    for (let i = 0; i < attrs.length; i++) {
-      if (attrs[i].name.endsWith("-src") && IMG_EXT_RE.test(attrs[i].value)) return true;
-    }
-    return false;
-  }
-
-  function hasBgImage(el) {
+  function shouldPreBlur(el) {
+    if (el.hasAttribute && el.hasAttribute("image-src")) return true;
     const style = el.getAttribute("style");
-    return style && BG_IMG_RE.test(style);
-  }
-
-  function shouldBlurExtra(el) {
-    return isImageCustomElement(el) || hasBgImage(el);
+    if (style && BG_IMG_RE.test(style)) return true;
+    return false;
   }
 
   function blurElement(el) {
@@ -51,23 +39,21 @@
     el.style.clipPath = "inset(0)";
   }
 
-  function shouldBlurOnInsert(el) {
-    return shouldBlurExtra(el) || (el.hasAttribute && el.hasAttribute("image-src"));
+  function processNode(node) {
+    if (node.nodeType !== 1) return;
+    if (shouldPreBlur(node)) blurElement(node);
+    observeElement(node);
+    if (node.querySelectorAll) {
+      node.querySelectorAll("*").forEach((child) => {
+        if (shouldPreBlur(child)) blurElement(child);
+        observeElement(child);
+      });
+    }
   }
 
-  // Blur custom image elements and background-image divs as soon as they enter the DOM
   new MutationObserver((mutations) => {
     for (const m of mutations) {
-      for (const node of m.addedNodes) {
-        if (node.nodeType !== 1) continue;
-        if (shouldBlurOnInsert(node)) blurElement(node);
-        if (node.querySelectorAll) {
-          node.querySelectorAll("[image-src]").forEach(blurElement);
-          node.querySelectorAll("*").forEach((child) => {
-            if (shouldBlurExtra(child)) blurElement(child);
-          });
-        }
-      }
+      for (const node of m.addedNodes) processNode(node);
     }
   }).observe(document.documentElement, { childList: true, subtree: true });
 
@@ -137,6 +123,11 @@
     if (imageSrc) return imageSrc;
     const src = el.currentSrc || el.src;
     if (src && !src.includes(" ")) return src;
+    const bg = getComputedStyle(el).backgroundImage;
+    if (bg && bg !== "none") {
+      const match = bg.match(/url\(["']?([^"')]+)["']?\)/);
+      if (match) return match[1];
+    }
     return null;
   }
 
@@ -149,15 +140,17 @@
   async function processImage(img) {
     if (segProcessed.has(img)) return;
     const imageSrcAttr = img.getAttribute("image-src");
-    const src = imageSrcAttr || img.currentSrc || img.src;
+    const src = imageSrcAttr || img.currentSrc || img.src || getImageUrl(img);
     if (!src) return;
-    if (!imageSrcAttr && (img.naturalWidth === 0 || img.naturalHeight === 0)) {
-      img.addEventListener("load", () => enqueueImage(img), { once: true });
-      return;
-    }
-    if (!imageSrcAttr && (img.naturalWidth < 48 || img.naturalHeight < 48)) {
-      markDone(img);
-      return;
+    if (img.tagName === "IMG" && !imageSrcAttr) {
+      if (img.naturalWidth === 0 || img.naturalHeight === 0) {
+        img.addEventListener("load", () => enqueueImage(img), { once: true });
+        return;
+      }
+      if (img.naturalWidth < 48 || img.naturalHeight < 48) {
+        markDone(img);
+        return;
+      }
     }
 
     segProcessed.add(img);
@@ -249,21 +242,26 @@
         didPaint = true;
       }
     }
-    if (img.tagName === "IMG") {
-      selfUpdating = true;
-      if (didPaint) {
-        const canvas = document.createElement("canvas");
-        canvas.width = w;
-        canvas.height = h;
-        const ctx = canvas.getContext("2d");
-        ctx.putImageData(new ImageData(new Uint8ClampedArray(pixels), w, h), 0, 0);
+    if (didPaint) {
+      const canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext("2d");
+      ctx.putImageData(new ImageData(new Uint8ClampedArray(pixels), w, h), 0, 0);
+      const dataUrl = canvas.toDataURL("image/png");
+      if (img.tagName === "IMG") {
+        selfUpdating = true;
         const picture = img.closest("picture");
         if (picture) picture.querySelectorAll("source").forEach((s) => s.remove());
         img.removeAttribute("srcset");
-        img.src = canvas.toDataURL("image/png");
-      } else if (segOriginalSrc.has(img)) {
-        img.src = segOriginalSrc.get(img);
+        img.src = dataUrl;
+        selfUpdating = false;
+      } else {
+        img.style.setProperty("background-image", `url(${dataUrl})`, "important");
       }
+    } else if (img.tagName === "IMG" && segOriginalSrc.has(img)) {
+      selfUpdating = true;
+      img.src = segOriginalSrc.get(img);
       selfUpdating = false;
     }
     const filter = buildFilter(!blurOff);
@@ -311,23 +309,40 @@
     }
   }
 
+  const SKIP_BG_TAGS = new Set(["SCRIPT", "STYLE", "LINK", "META", "BR", "HR", "INPUT", "TEXTAREA", "SELECT", "BUTTON", "SVG", "PATH", "IMG"]);
+
   const visibilityObserver = new IntersectionObserver((entries) => {
     for (const entry of entries) {
-      if (entry.isIntersecting) {
-        visibilityObserver.unobserve(entry.target);
-        enqueueImage(entry.target);
+      if (!entry.isIntersecting) continue;
+      const el = entry.target;
+      visibilityObserver.unobserve(el);
+      if (segProcessed.has(el) || segMaskCache.has(el)) continue;
+      if (el.tagName === "IMG" || el.hasAttribute("image-src")) {
+        enqueueImage(el);
+      } else {
+        if (el.offsetWidth < 48 || el.offsetHeight < 48) continue;
+        const bg = getComputedStyle(el).backgroundImage;
+        if (!bg || bg === "none") continue;
+        if (bg.startsWith("linear-gradient") || bg.startsWith("radial-gradient")) continue;
+        const match = bg.match(/url\(["']?([^"')]+)["']?\)/);
+        if (!match) continue;
+        if (/\.(svg|gif)(\?|$)/i.test(match[1])) continue;
+        blurElement(el);
+        enqueueImage(el);
       }
     }
   });
 
-  function observeImage(img) {
-    if (segProcessed.has(img) || segMaskCache.has(img)) return;
-    visibilityObserver.observe(img);
+  function observeElement(el) {
+    if (segProcessed.has(el) || segMaskCache.has(el)) return;
+    if (el.tagName === "IMG" || el.hasAttribute("image-src") || !SKIP_BG_TAGS.has(el.tagName)) {
+      visibilityObserver.observe(el);
+    }
   }
 
   function runSegmentation() {
-    document.querySelectorAll("img").forEach(observeImage);
-    document.querySelectorAll("[image-src]").forEach(observeImage);
+    document.querySelectorAll("img").forEach(observeElement);
+    document.querySelectorAll("[image-src]").forEach(observeElement);
   }
 
 
