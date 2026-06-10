@@ -37,7 +37,9 @@
         "https://wd12.myworkday.com/*",
         "https://*.adp.com/*",
         "https://idp.federate.amazon.com/*",
-        "https://idp-us-east-1.federate.amazon.com/*"
+        "https://idp-us-east-1.federate.amazon.com/*",
+        "https://midway.amazon.com/*",
+        "https://*.midway-auth.amazon.com/*"
       ]
     },
     {
@@ -65,7 +67,9 @@
         "https://wd12.myworkday.com/*",
         "https://*.adp.com/*",
         "https://idp.federate.amazon.com/*",
-        "https://idp-us-east-1.federate.amazon.com/*"
+        "https://idp-us-east-1.federate.amazon.com/*",
+        "https://midway.amazon.com/*",
+        "https://*.midway-auth.amazon.com/*"
       ]
     }
   ]
