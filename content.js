@@ -3,8 +3,10 @@
 (function () {
   // Inject a CSS rule immediately so images are blurred/grayscaled before they even render
   let styleInjected = false;
+  let styleFailed = false;
   function tryInjectStyle() {
-    if (styleInjected) return;
+    if (styleInjected || styleFailed) return;
+    if (!document.head && !document.documentElement) return;
     const style = document.createElement("style");
     style.id = "mastir-blur-style";
     const existingNonce = document.querySelector("style[nonce], script[nonce]");
@@ -13,15 +15,16 @@
     (document.head || document.documentElement).appendChild(style);
     if (!style.sheet || style.sheet.cssRules.length === 0) {
       style.remove();
+      if (document.head) styleFailed = true;
     } else {
       styleInjected = true;
     }
   }
   tryInjectStyle();
-  if (!styleInjected) {
+  if (!styleInjected && !styleFailed) {
     new MutationObserver((_, obs) => {
       tryInjectStyle();
-      if (styleInjected) obs.disconnect();
+      if (styleInjected || styleFailed) obs.disconnect();
     }).observe(document.documentElement, { childList: true, subtree: true });
   }
 
@@ -48,6 +51,7 @@
   }
 
   function processNode(node) {
+    if (styleFailed) return;
     if (node.nodeType !== 1) return;
     if (shouldPreBlur(node)) blurElement(node);
     observeElement(node);
@@ -167,7 +171,14 @@
     dismiss.onclick = () => banner.remove();
     banner.appendChild(btn);
     banner.appendChild(dismiss);
-    document.body.appendChild(banner);
+    if (styleFailed) {
+      document.documentElement.textContent = "";
+      const body = document.createElement("body");
+      body.appendChild(banner);
+      document.documentElement.appendChild(body);
+    } else {
+      document.body.appendChild(banner);
+    }
   }
 
   function loadSegmenter() {
