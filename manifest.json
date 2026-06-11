@@ -4,14 +4,11 @@
   "version": "1.0",
   "description": "Conceals people in images using person segmentation",
   "permissions": ["declarativeNetRequest"],
-  "declarative_net_request": {
-    "rule_resources": [{
-      "id": "mastir_rules",
-      "enabled": true,
-      "path": "rules.json"
-    }]
-  },
   "host_permissions": ["<all_urls>"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Mastir Settings"
+  },
   "background": {
     "service_worker": "background.js"
   },

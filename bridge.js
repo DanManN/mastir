@@ -20,4 +20,15 @@ window.addEventListener("message", (e) => {
       window.postMessage({ type: "mastir-fetch-response", id, dataUrl: response.dataUrl, error: response.error }, "*");
     });
   }
+
+  if (e.data?.type === "mastir-csp-strip") {
+    const { id, domain } = e.data;
+    chrome.runtime.sendMessage({ type: "csp-strip-request", domain }, (response) => {
+      if (chrome.runtime.lastError) {
+        window.postMessage({ type: "mastir-csp-strip-response", id, error: chrome.runtime.lastError.message }, "*");
+        return;
+      }
+      window.postMessage({ type: "mastir-csp-strip-response", id, status: response.status }, "*");
+    });
+  }
 });

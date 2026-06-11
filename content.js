@@ -119,31 +119,98 @@
     }
   });
 
+  let cspPrompted = false;
+
+  function promptCspStrip() {
+    if (cspPrompted) return;
+    cspPrompted = true;
+    const domain = location.hostname;
+    const banner = document.createElement("div");
+    Object.assign(banner.style, {
+      position: "fixed", top: "10px", right: "10px", zIndex: "99999",
+      background: "#333", color: "#fff", padding: "12px 16px",
+      borderRadius: "8px", fontSize: "14px", maxWidth: "320px",
+      boxShadow: "0 4px 12px rgba(0,0,0,0.3)", fontFamily: "sans-serif",
+    });
+    const title = document.createElement("span");
+    title.textContent = "Mastir";
+    Object.assign(title.style, { fontWeight: "bold" });
+    banner.appendChild(title);
+    banner.appendChild(document.createElement("br"));
+    banner.appendChild(document.createElement("br"));
+    const desc = document.createElement("span");
+    desc.textContent = "This site's Content Security Policy prevents image segmentation. To enable Mastir here, the CSP header must be removed for this domain.";
+    banner.appendChild(desc);
+    banner.appendChild(document.createElement("br"));
+    banner.appendChild(document.createElement("br"));
+    const warning = document.createElement("span");
+    Object.assign(warning.style, { color: "#ffa", fontSize: "12px" });
+    warning.textContent = "⚠ This reduces protection against cross-site scripting (XSS) on this site. Only allow on sites you trust.";
+    banner.appendChild(warning);
+    banner.appendChild(document.createElement("br"));
+    banner.appendChild(document.createElement("br"));
+    const btn = document.createElement("button");
+    Object.assign(btn.style, {
+      background: "#047c9d", color: "#fff", border: "none", borderRadius: "4px",
+      padding: "6px 12px", cursor: "pointer", marginRight: "8px",
+    });
+    btn.textContent = "Allow & Reload";
+    btn.onclick = () => {
+      bridgeRequest("mastir-csp-strip", { domain }).then(() => location.reload());
+    };
+    const dismiss = document.createElement("button");
+    Object.assign(dismiss.style, {
+      background: "transparent", color: "#aaa", border: "1px solid #555",
+      borderRadius: "4px", padding: "6px 12px", cursor: "pointer",
+    });
+    dismiss.textContent = "Dismiss";
+    dismiss.onclick = () => banner.remove();
+    banner.appendChild(btn);
+    banner.appendChild(dismiss);
+    document.body.appendChild(banner);
+  }
+
   function loadSegmenter() {
     if (segmenter) return Promise.resolve(segmenter);
     if (segLoading) return segLoading;
     segLoading = (async () => {
-      let vision, wasmBase;
+      let vision, wasmBase, modelPath;
       try {
         vision = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0/vision_bundle.mjs");
         wasmBase = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0/wasm";
+        console.log("[mastir] vision: CDN");
       } catch (e) {
-        if (!bundledVisionUrl) { segLoading = null; throw e; }
+        if (!bundledVisionUrl) { segLoading = null; promptCspStrip(); throw e; }
         vision = await import(bundledVisionUrl);
         wasmBase = bundledWasmUrl;
+        console.log("[mastir] vision: bundled");
       }
-      const wasmFiles = await vision.FilesetResolver.forVisionTasks(wasmBase);
-      segmenter = await vision.ImageSegmenter.createFromOptions(wasmFiles, {
-        baseOptions: {
-          modelAssetPath: bundledModelUrl || "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite",
-          delegate: "GPU",
-        },
-        runningMode: "IMAGE",
-        outputCategoryMask: true,
-        outputConfidenceMasks: false,
-      });
+      modelPath = bundledModelUrl || "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite";
+      console.log("[mastir] model:", bundledModelUrl ? "bundled" : "CDN");
+      try {
+        const wasmFiles = await vision.FilesetResolver.forVisionTasks(wasmBase);
+        segmenter = await vision.ImageSegmenter.createFromOptions(wasmFiles, {
+          baseOptions: { modelAssetPath: modelPath, delegate: "GPU" },
+          runningMode: "IMAGE",
+          outputCategoryMask: true,
+          outputConfidenceMasks: false,
+        });
+        console.log("[mastir] wasm:", wasmBase.startsWith("chrome-extension") ? "bundled" : "CDN");
+      } catch (e) {
+        if (!bundledWasmUrl || wasmBase === bundledWasmUrl) throw e;
+        console.log("[mastir] wasm CDN failed, falling back to bundled");
+        const wasmFiles = await vision.FilesetResolver.forVisionTasks(bundledWasmUrl);
+        segmenter = await vision.ImageSegmenter.createFromOptions(wasmFiles, {
+          baseOptions: { modelAssetPath: modelPath, delegate: "GPU" },
+          runningMode: "IMAGE",
+          outputCategoryMask: true,
+          outputConfidenceMasks: false,
+        });
+        console.log("[mastir] wasm: bundled (fallback)");
+      }
+      console.log("[mastir] segmenter ready");
       return segmenter;
-    })().catch((e) => { segLoading = null; throw e; });
+    })().catch((e) => { segLoading = null; promptCspStrip(); throw e; });
     return segLoading;
   }
 
