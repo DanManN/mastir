@@ -17,6 +17,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  if (msg.type === "hard-reload") {
+    chrome.tabs.reload(sender.tab.id, { bypassCache: true }, () => {
+      sendResponse({ status: "reloaded" });
+    });
+    return true;
+  }
+
   if (msg.type === "csp-strip-request") {
     const domain = msg.domain;
     chrome.declarativeNetRequest.getDynamicRules((rules) => {

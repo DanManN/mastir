@@ -21,6 +21,13 @@ window.addEventListener("message", (e) => {
     });
   }
 
+  if (e.data?.type === "mastir-hard-reload") {
+    const { id } = e.data;
+    chrome.runtime.sendMessage({ type: "hard-reload" }, () => {
+      window.postMessage({ type: "mastir-hard-reload-response", id }, "*");
+    });
+  }
+
   if (e.data?.type === "mastir-csp-strip") {
     const { id, domain } = e.data;
     chrome.runtime.sendMessage({ type: "csp-strip-request", domain }, (response) => {
