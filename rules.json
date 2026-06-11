@@ -10,7 +10,7 @@
       ]
     },
     "condition": {
-      "requestDomains": ["youtube.com", "www.youtube.com"],
+      "requestDomains": ["youtube.com", "www.youtube.com", "app.espresa.com"],
       "resourceTypes": ["main_frame", "sub_frame"]
     }
   }
