@@ -2,6 +2,31 @@
 
 const domainsEl = document.getElementById("domains");
 const resetBtn = document.getElementById("reset");
+const blurSlider = document.getElementById("blur-slider");
+const blurVal = document.getElementById("blur-val");
+const grayToggle = document.getElementById("gray-toggle");
+
+let grayOn = true;
+
+function sendSettings(settings) {
+  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    if (tabs[0]?.id) {
+      chrome.tabs.sendMessage(tabs[0].id, { type: "mastir-settings", ...settings });
+    }
+  });
+}
+
+blurSlider.addEventListener("input", () => {
+  blurVal.textContent = blurSlider.value;
+  sendSettings({ blurAmount: parseInt(blurSlider.value) });
+});
+
+grayToggle.addEventListener("click", () => {
+  grayOn = !grayOn;
+  grayToggle.textContent = "Grayscale: " + (grayOn ? "On" : "Off");
+  grayToggle.classList.toggle("active", grayOn);
+  sendSettings({ grayOn });
+});
 
 function loadRules() {
   chrome.declarativeNetRequest.getDynamicRules((rules) => {

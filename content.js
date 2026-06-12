@@ -76,7 +76,7 @@
 
   let blurAmount = 0;
   let blurOff = true;
-  let grayOn = true;
+  let grayOn = false;
 
   // --- Person Segmentation ---
   const segProcessed = new WeakSet();
@@ -506,124 +506,6 @@
 
 
   // --- UI ---
-  function setImportant(el, props) {
-    for (const [k, v] of Object.entries(props)) {
-      el.style.setProperty(k, v, "important");
-    }
-  }
-
-  function createButton(text, bgColor, borderColor, borderRadius, clickHandler) {
-    const btn = document.createElement("button");
-    setImportant(btn, {
-      padding: "8px 12px", "background-color": bgColor, color: "#FFF",
-      border: `2px solid ${borderColor}`, "border-radius": borderRadius, "font-size": "14px",
-      cursor: "pointer", transition: "all 0.3s ease", "line-height": "1",
-      "font-family": "sans-serif", "font-weight": "normal", "text-transform": "none",
-      "letter-spacing": "normal", "text-decoration": "none", "box-shadow": "none",
-      margin: "0", "min-width": "0", "min-height": "0", display: "inline-block",
-      "box-sizing": "content-box", width: "auto", height: "auto", "appearance": "none",
-      outline: "none", "outline-offset": "0", "box-shadow": "none",
-      "background-image": "none", "text-shadow": "none",
-    });
-    btn.textContent = text;
-    btn.dataset.bgColor = bgColor;
-    btn.onmouseenter = () => btn.style.setProperty("background-color", darkenColor(btn.dataset.bgColor), "important");
-    btn.onmouseleave = () => btn.style.setProperty("background-color", btn.dataset.bgColor, "important");
-    btn.onclick = clickHandler;
-    return btn;
-  }
-
-  function updateBtn(id, active, onText, offText, onColor = "#555", offColor = "#f00", onBorder = "#333", offBorder = "#a00") {
-    const btn = document.getElementById(id);
-    if (!btn) return;
-    const color = active ? onColor : offColor;
-    btn.dataset.bgColor = color;
-    btn.style.setProperty("background-color", color, "important");
-    btn.style.setProperty("border-color", active ? onBorder : offBorder, "important");
-    btn.textContent = active ? onText : offText;
-  }
-
-  function darkenColor(hex) {
-    let num = parseInt(hex.slice(1), 16) - 0x202020;
-    return `#${Math.max(0, num).toString(16).padStart(6, "0")}`;
-  }
-
-  function createToggleButton() {
-    const container = document.createElement("div");
-    container.id = "mastir-controls";
-    setImportant(container, {
-      position: "fixed", bottom: "25px", left: "25px", "z-index": "9999",
-      display: "flex", "user-select": "none", "font-family": "sans-serif",
-    });
-
-    let collapsed = false;
-
-    const sliderWrap = document.createElement("div");
-    setImportant(sliderWrap, {
-      display: "flex", "align-items": "center", "background-color": "#555",
-      border: "2px solid #333", padding: "4px 10px", gap: "6px",
-    });
-    const sliderLabel = document.createElement("span");
-    sliderLabel.textContent = "0";
-    setImportant(sliderLabel, {
-      color: "#FFF", "font-size": "12px", "min-width": "20px", "text-align": "center",
-      "font-family": "sans-serif", "line-height": "1", margin: "0", padding: "0",
-    });
-    const slider = document.createElement("input");
-    slider.type = "range"; slider.min = "0"; slider.max = "20"; slider.value = "0";
-    setImportant(slider, {
-      width: "80px", cursor: "pointer", height: "auto", margin: "0",
-      "vertical-align": "middle", "appearance": "auto",
-    });
-    slider.addEventListener("input", () => {
-      blurAmount = parseInt(slider.value);
-      sliderLabel.textContent = blurAmount;
-      blurOff = blurAmount === 0;
-      applyBlur();
-      broadcastState();
-    });
-    sliderWrap.append(slider, sliderLabel);
-
-    const grayBtn = createButton("Gray On", "#555", "#333", "0 10px 10px 0", toggleGray);
-    grayBtn.id = "toggle_gray";
-
-    const extraBtns = [sliderWrap, grayBtn];
-
-    const hideBtn = createButton("Hide", "#047c9dff", "#09495bff", "10px 0 0 10px", () => {});
-    hideBtn.style.cursor = "grab";
-
-    let isDragging = false, dragMoved = false, offsetX, offsetY;
-    hideBtn.addEventListener("mousedown", (e) => {
-      isDragging = true; dragMoved = false;
-      offsetX = e.clientX - container.getBoundingClientRect().left;
-      offsetY = e.clientY - container.getBoundingClientRect().top;
-      hideBtn.style.cursor = "grabbing"; e.preventDefault();
-    });
-    document.addEventListener("mousemove", (e) => {
-      if (!isDragging) return;
-      dragMoved = true;
-      container.style.left = (e.clientX - offsetX) + "px";
-      container.style.top = (e.clientY - offsetY) + "px";
-      container.style.bottom = "auto";
-    });
-    document.addEventListener("mouseup", () => {
-      if (!isDragging) return;
-      isDragging = false; hideBtn.style.cursor = "grab";
-      if (!dragMoved) {
-        collapsed = !collapsed;
-        extraBtns.forEach(btn => btn.style.display = collapsed ? "none" : "");
-        hideBtn.style.borderRadius = collapsed ? "10px" : "10px 0 0 10px";
-        hideBtn.textContent = collapsed ? "Show" : "Hide";
-        const c = collapsed ? "#555" : "#047c9dff";
-        hideBtn.dataset.bgColor = c; hideBtn.style.backgroundColor = c;
-        hideBtn.style.borderColor = collapsed ? "#333" : "#09495bff";
-        grayBtn.style.borderRadius = collapsed ? "" : "0 10px 10px 0";
-      }
-    });
-
-    container.append(hideBtn, ...extraBtns);
-    document.body.appendChild(container);
-  }
 
   function buildFilter(includeBlur) {
     const parts = [];
@@ -647,26 +529,12 @@
     });
   }
 
-  function applyState(state) {
-    blurOff = state.blurOff;
-    grayOn = state.grayOn;
-    blurAmount = state.blurAmount;
-    applyBlur();
-    applyBlur();
-  }
-
-
-  function toggleGray() {
-    grayOn = !grayOn;
-    applyBlur();
-    updateBtn("toggle_gray", grayOn, "Gray On", "Gray Off");
-    applyBlur();
-    broadcastState();
-  }
-
   window.addEventListener("message", (e) => {
-    if (e.data && e.data.type === "mastir-sync") {
-      applyState(e.data);
+    if (e.data && (e.data.type === "mastir-sync" || e.data.type === "mastir-settings")) {
+      if (e.data.grayOn !== undefined) grayOn = e.data.grayOn;
+      if (e.data.blurAmount !== undefined) { blurAmount = e.data.blurAmount; blurOff = blurAmount === 0; }
+      if (e.data.blurOff !== undefined) blurOff = e.data.blurOff;
+      applyBlur();
       broadcastState();
     }
   });
@@ -717,9 +585,6 @@
         segDebounce = setTimeout(() => { segDebounce = null; runSegmentation(); }, 500);
       }
     }).observe(document.body, { childList: true, subtree: true });
-    if (window === window.top && !document.getElementById("mastir-controls")) {
-      createToggleButton();
-    }
     applyBlur();
     runSegmentation();
   });

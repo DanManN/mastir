@@ -7,6 +7,12 @@ window.postMessage({
   wasmUrl: chrome.runtime.getURL("wasm")
 }, "*");
 
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg.type === "mastir-settings") {
+    window.postMessage(msg, "*");
+  }
+});
+
 window.addEventListener("message", (e) => {
   if (e.source !== window) return;
 
