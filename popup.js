@@ -6,7 +6,7 @@ const blurSlider = document.getElementById("blur-slider");
 const blurVal = document.getElementById("blur-val");
 const grayToggle = document.getElementById("gray-toggle");
 
-let grayOn = true;
+let grayOn = false;
 
 function sendSettings(settings) {
   chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
