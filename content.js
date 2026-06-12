@@ -41,8 +41,8 @@
   }
 
   function shouldPreBlur(el) {
+    if (el.tagName === "IFRAME") return false;
     if (el.hasAttribute && el.hasAttribute("image-src")) return true;
-    if (isVideoIframe(el)) return true;
     const style = el.getAttribute("style");
     if (style && BG_IMG_RE.test(style)) return true;
     return false;
