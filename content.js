@@ -15,7 +15,10 @@
     (document.head || document.documentElement).appendChild(style);
     if (!style.sheet || style.sheet.cssRules.length === 0) {
       style.remove();
-      if (document.head) styleFailed = true;
+      if (document.head) {
+        styleFailed = true;
+        promptCspStrip();
+      }
     } else {
       styleInjected = true;
     }
@@ -176,6 +179,17 @@
     if (styleFailed) {
       document.documentElement.textContent = "";
       const body = document.createElement("body");
+      const msg = document.createElement("pre");
+      msg.textContent = [
+        "Mastir - Page Hidden",
+        "",
+        "This site's security policy prevents Mastir from blurring images.",
+        "The page content has been hidden to avoid showing unprotected images.",
+        "",
+        "Please acknowledge the banner to continue.",
+        "",
+      ].join("\n");
+      body.appendChild(msg);
       body.appendChild(banner);
       document.documentElement.appendChild(body);
     } else {
@@ -223,7 +237,10 @@
       }
       console.log("[mastir] segmenter ready");
       return segmenter;
-    })().catch((e) => { promptCspStrip(); throw e; });
+    })().catch((e) => {
+      if (/CSP|Content Security Policy|Trusted|blocked/i.test(e.message)) promptCspStrip();
+      throw e;
+    });
     return segLoading;
   }
 
@@ -357,11 +374,15 @@
       applyMask(img);
     } catch (e) {
       console.warn("[mastir] processImage failed:", e.message, src?.substring(0, 80));
-      segProcessed.delete(img);
-      const retries = (img.__mastirRetries || 0) + 1;
-      img.__mastirRetries = retries;
-      if (retries <= 5) {
-        setTimeout(() => enqueueImage(img), retries * 2000);
+      if (/SVG|natural dimensions|createImageBitmap/i.test(e.message)) {
+        markDone(img);
+      } else {
+        segProcessed.delete(img);
+        const retries = (img.__mastirRetries || 0) + 1;
+        img.__mastirRetries = retries;
+        if (retries <= 5) {
+          setTimeout(() => enqueueImage(img), retries * 2000);
+        }
       }
     }
   }
