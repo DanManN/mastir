@@ -164,7 +164,9 @@
     btn.textContent = "Allow & Reload";
     btn.onclick = () => {
       bridgeRequest("mastir-csp-strip", { domain }).then(() => {
-        bridgeRequest("mastir-hard-reload", {}).catch(() => location.reload());
+        setTimeout(() => {
+          bridgeRequest("mastir-hard-reload", {}).catch(() => location.reload());
+        }, 300);
       });
     };
     const dismiss = document.createElement("button");
@@ -238,7 +240,13 @@
       console.log("[mastir] segmenter ready");
       return segmenter;
     })().catch((e) => {
-      if (/CSP|Content Security Policy|Trusted|blocked/i.test(e.message)) promptCspStrip();
+      if (/CSP|Content Security Policy|Trusted|blocked/i.test(e.message)) {
+        if (!document.querySelector('meta[http-equiv="Content-Security-Policy"]')) {
+          promptCspStrip();
+        } else {
+          console.log("[mastir] meta CSP detected, cannot strip — images will stay blurred");
+        }
+      }
       throw e;
     });
     return segLoading;
