@@ -1,6 +1,8 @@
 "use strict";
 
 (function () {
+  if (document.contentType?.includes("svg")) return;
+
   // Inject a CSS rule immediately so images are blurred/grayscaled before they even render
   let styleInjected = false;
   let styleFailed = false;
@@ -52,6 +54,8 @@
     el.style.setProperty("filter", MAX_BLUR, "important");
     el.style.clipPath = "inset(0)";
   }
+
+  const isDirectImageView = document.contentType?.startsWith("image/");
 
   function processNode(node) {
     if (styleFailed) return;
@@ -434,7 +438,23 @@
       const ctx = canvas.getContext("2d");
       ctx.putImageData(new ImageData(new Uint8ClampedArray(pixels), w, h), 0, 0);
       const dataUrl = canvas.toDataURL("image/png");
-      if (img.tagName === "IMG") {
+      if (img.tagName === "IMG" && isDirectImageView) {
+        let overlay = img.__mastirOverlay;
+        if (!overlay) {
+          overlay = document.createElement("div");
+          Object.assign(overlay.style, {
+            position: "absolute", top: "0", left: "0", width: "100%", height: "100%",
+            pointerEvents: "none", backgroundSize: "100% 100%", zIndex: "1",
+          });
+          img.__mastirOverlay = overlay;
+          const parent = img.parentElement;
+          if (parent) {
+            if (getComputedStyle(parent).position === "static") parent.style.position = "relative";
+            parent.insertBefore(overlay, img.nextSibling);
+          }
+        }
+        overlay.style.setProperty("background-image", `url(${dataUrl})`, "important");
+      } else if (img.tagName === "IMG") {
         selfUpdating = true;
         const picture = img.closest("picture");
         if (picture) picture.querySelectorAll("source").forEach((s) => s.remove());
