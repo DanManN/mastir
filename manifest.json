@@ -19,7 +19,8 @@
       "run_at": "document_start",
       "world": "MAIN",
       "exclude_matches": [
-        "https://*.midway-auth.amazon.com/*"
+        "https://*.midway-auth.amazon.com/*",
+        "https://*.console.aws.amazon.com/*"
       ]
     },
     {
@@ -28,7 +29,8 @@
       "run_at": "document_start",
       "world": "ISOLATED",
       "exclude_matches": [
-        "https://*.midway-auth.amazon.com/*"
+        "https://*.midway-auth.amazon.com/*",
+        "https://*.console.aws.amazon.com/*"
       ]
     }
   ],

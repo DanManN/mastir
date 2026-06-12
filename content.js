@@ -114,6 +114,7 @@
   // --- GPU segmenter (CDN → bundled fallback) ---
   let segmenter = null;
   let segLoading = null;
+  let segFailed = false;
   let bundledVisionUrl = null;
   let bundledWasmUrl = null;
   let bundledModelUrl = null;
@@ -216,38 +217,41 @@
       }
       modelPath = bundledModelUrl || "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite";
       console.log("[mastir] model:", bundledModelUrl ? "bundled" : "CDN");
+
+      async function createSegmenter(wasm) {
+        const wasmFiles = await vision.FilesetResolver.forVisionTasks(wasm);
+        return Promise.race([
+          vision.ImageSegmenter.createFromOptions(wasmFiles, {
+            baseOptions: { modelAssetPath: modelPath, delegate: "GPU" },
+            runningMode: "IMAGE",
+            outputCategoryMask: true,
+            outputConfidenceMasks: false,
+          }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("WASM init timeout (CSP blocked)")), 10000)),
+        ]);
+      }
+
       try {
-        const wasmFiles = await vision.FilesetResolver.forVisionTasks(wasmBase);
-        segmenter = await vision.ImageSegmenter.createFromOptions(wasmFiles, {
-          baseOptions: { modelAssetPath: modelPath, delegate: "GPU" },
-          runningMode: "IMAGE",
-          outputCategoryMask: true,
-          outputConfidenceMasks: false,
-        });
+        segmenter = await createSegmenter(wasmBase);
         console.log("[mastir] wasm:", wasmBase.startsWith("chrome-extension") ? "bundled" : "CDN");
       } catch (e) {
         if (!bundledWasmUrl || wasmBase === bundledWasmUrl) throw e;
         console.log("[mastir] wasm CDN failed, falling back to bundled");
-        const wasmFiles = await vision.FilesetResolver.forVisionTasks(bundledWasmUrl);
-        segmenter = await vision.ImageSegmenter.createFromOptions(wasmFiles, {
-          baseOptions: { modelAssetPath: modelPath, delegate: "GPU" },
-          runningMode: "IMAGE",
-          outputCategoryMask: true,
-          outputConfidenceMasks: false,
-        });
+        segmenter = await createSegmenter(bundledWasmUrl);
         console.log("[mastir] wasm: bundled (fallback)");
       }
       console.log("[mastir] segmenter ready");
       return segmenter;
     })().catch((e) => {
-      if (/CSP|Content Security Policy|Trusted|blocked/i.test(e.message)) {
+      segFailed = true;
+      console.warn("[mastir] segmenter failed permanently:", e.message);
+      if (/CSP|Content Security Policy|Trusted|blocked|timeout|Assertion|Aborted|wasm/i.test(e.message)) {
         if (!document.querySelector('meta[http-equiv="Content-Security-Policy"]')) {
           promptCspStrip();
         } else {
           console.log("[mastir] meta CSP detected, cannot strip — images will stay blurred");
         }
       }
-      throw e;
     });
     return segLoading;
   }
@@ -317,6 +321,7 @@
   }
 
   async function processImage(img) {
+    if (segFailed) return;
     if (segProcessed.has(img)) return;
     if (isVideoIframe(img)) { segProcessed.add(img); return; }
     const imageSrcAttr = img.getAttribute("image-src");
@@ -382,7 +387,7 @@
       applyMask(img);
     } catch (e) {
       console.warn("[mastir] processImage failed:", e.message, src?.substring(0, 80));
-      if (/SVG|natural dimensions|createImageBitmap/i.test(e.message)) {
+      if (/SVG|natural dimensions|createImageBitmap|Assertion|CORS|blocked|decode failed/i.test(e.message)) {
         markDone(img);
       } else {
         segProcessed.delete(img);
