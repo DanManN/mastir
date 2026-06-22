@@ -18,8 +18,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === "hard-reload") {
-    chrome.tabs.reload(sender.tab.id, { bypassCache: true }, () => {
-      sendResponse({ status: "reloaded" });
+    const origin = sender.origin || new URL(sender.url).origin;
+    chrome.browsingData.remove({
+      origins: [origin],
+    }, { cacheStorage: true, cache: true, serviceWorkers: true }, () => {
+      chrome.tabs.reload(sender.tab.id, { bypassCache: true }, () => {
+        sendResponse({ status: "reloaded" });
+      });
     });
     return true;
   }

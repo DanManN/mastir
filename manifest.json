@@ -3,7 +3,7 @@
   "name": "Mastir",
   "version": "1.0",
   "description": "Conceals people in images using person segmentation",
-  "permissions": ["declarativeNetRequest"],
+  "permissions": ["declarativeNetRequest", "browsingData"],
   "host_permissions": ["<all_urls>"],
   "action": {
     "default_popup": "popup.html",
@@ -20,7 +20,8 @@
       "world": "MAIN",
       "all_frames": true,
       "exclude_matches": [
-        "https://*.midway-auth.amazon.com/*"
+        "https://*.midway-auth.amazon.com/*",
+        "https://w.amazon.com/*"
       ]
     },
     {
@@ -30,7 +31,8 @@
       "world": "ISOLATED",
       "all_frames": true,
       "exclude_matches": [
-        "https://*.midway-auth.amazon.com/*"
+        "https://*.midway-auth.amazon.com/*",
+        "https://w.amazon.com/*"
       ]
     }
   ],

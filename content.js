@@ -137,6 +137,10 @@
     if (cspPrompted) return;
     cspPrompted = true;
     const domain = location.hostname;
+    showCspBanner(domain);
+  }
+
+  function showCspBanner(domain) {
     const banner = document.createElement("div");
     Object.assign(banner.style, {
       position: "fixed", top: "10px", right: "10px", zIndex: "99999",
@@ -364,9 +368,10 @@
 
       const bitmap = await new Promise((resolve, reject) => {
         const tmp = new Image();
-        tmp.crossOrigin = "anonymous";
+        if (!fetchUrl.startsWith("blob:")) tmp.crossOrigin = "anonymous";
         tmp.onload = () => resolve(createImageBitmap(tmp));
         tmp.onerror = () => {
+          if (fetchUrl.startsWith("blob:")) { reject(new Error("blob load failed")); return; }
           crossFetch(fetchUrl).then((dataUrl) => {
             const tmp2 = new Image();
             tmp2.onload = () => resolve(createImageBitmap(tmp2));
@@ -391,7 +396,7 @@
       applyMask(img);
     } catch (e) {
       console.warn("[mastir] processImage failed:", e.message, src?.substring(0, 80));
-      if (/SVG|natural dimensions|createImageBitmap|Assertion|CORS|blocked|decode failed/i.test(e.message)) {
+      if (/SVG|natural dimensions|createImageBitmap|Assertion|CORS|blocked|decode failed|blob load failed/i.test(e.message)) {
         markDone(img);
       } else {
         segProcessed.delete(img);
