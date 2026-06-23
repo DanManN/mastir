@@ -7,6 +7,10 @@ window.postMessage({
   wasmUrl: chrome.runtime.getURL("wasm")
 }, "*");
 
+chrome.storage.local.get({ blurAmount: 0, maskBlur: 4, maskExpand: 8, grayOn: false }, (s) => {
+  window.postMessage({ type: "mastir-settings", ...s }, "*");
+});
+
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === "mastir-settings") {
     window.postMessage(msg, "*");

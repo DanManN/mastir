@@ -66,8 +66,28 @@
       node.querySelectorAll("*").forEach((child) => {
         if (shouldPreBlur(child)) blurElement(child);
         observeElement(child);
+        if (child.shadowRoot) processShadowRoot(child.shadowRoot);
       });
     }
+    if (node.shadowRoot) processShadowRoot(node.shadowRoot);
+  }
+
+  function processShadowRoot(root) {
+    const style = document.createElement("style");
+    style.textContent = "img, video, [image-src] { filter: blur(20px) grayscale(100%) !important; clip-path: inset(0); }";
+    if (!root.querySelector("#mastir-blur-style")) {
+      style.id = "mastir-blur-style";
+      root.prepend(style);
+    }
+    root.querySelectorAll("*").forEach((child) => {
+      if (shouldPreBlur(child)) blurElement(child);
+      observeElement(child);
+    });
+    new MutationObserver((mutations) => {
+      for (const m of mutations) {
+        for (const node of m.addedNodes) processNode(node);
+      }
+    }).observe(root, { childList: true, subtree: true });
   }
 
   new MutationObserver((mutations) => {
@@ -81,6 +101,10 @@
   let blurAmount = 0;
   let blurOff = true;
   let grayOn = false;
+  let maskBlur = 4;
+  let maskExpand = 8;
+  let blurSpans = circleRowSpans(maskBlur);
+  let expandSpans = circleRowSpans(maskExpand);
 
   // --- Person Segmentation ---
   const segProcessed = new WeakSet();
@@ -272,6 +296,92 @@
     });
   }
 
+  function circleRowSpans(radius) {
+    const spans = [];
+    for (let dy = -radius; dy <= radius; dy++) {
+      spans.push({ dy, dx: Math.floor(Math.sqrt(radius * radius - dy * dy)) });
+    }
+    return spans;
+  }
+
+  function buildIntegral(src, w, h) {
+    const sat = new Uint32Array((w + 1) * (h + 1));
+    const stride = w + 1;
+    for (let y = 0; y < h; y++) {
+      let rowSum = 0;
+      for (let x = 0; x < w; x++) {
+        rowSum += src[y * w + x];
+        sat[(y + 1) * stride + (x + 1)] = rowSum + sat[y * stride + (x + 1)];
+      }
+    }
+    return sat;
+  }
+
+  function dilateOp(src, w, h, spans) {
+    const sat = buildIntegral(src, w, h);
+    const stride = w + 1;
+    const dst = new Uint8Array(w * h);
+    const numSpans = spans.length;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        let hit = false;
+        for (let s = 0; s < numSpans && !hit; s++) {
+          const row = y + spans[s].dy;
+          if (row < 0 || row >= h) continue;
+          const dx = spans[s].dx;
+          const x0 = x - dx < 0 ? 0 : x - dx;
+          const x1 = x + dx >= w ? w - 1 : x + dx;
+          if (sat[(row + 1) * stride + (x1 + 1)] - sat[row * stride + (x1 + 1)] - sat[(row + 1) * stride + x0] + sat[row * stride + x0] > 0) hit = true;
+        }
+        dst[y * w + x] = hit ? 255 : 0;
+      }
+    }
+    return dst;
+  }
+
+  function blurOp(src, w, h, spans) {
+    const sat = buildIntegral(src, w, h);
+    const stride = w + 1;
+    const dst = new Uint8Array(w * h);
+    const numSpans = spans.length;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        let sum = 0, count = 0;
+        for (let s = 0; s < numSpans; s++) {
+          const row = y + spans[s].dy;
+          if (row < 0 || row >= h) continue;
+          const dx = spans[s].dx;
+          const x0 = x - dx < 0 ? 0 : x - dx;
+          const x1 = x + dx >= w ? w - 1 : x + dx;
+          sum += sat[(row + 1) * stride + (x1 + 1)] - sat[row * stride + (x1 + 1)] - sat[(row + 1) * stride + x0] + sat[row * stride + x0];
+          count += x1 - x0 + 1;
+        }
+        const val = (sum / count) | 0;
+        dst[y * w + x] = val < 10 ? 0 : val;
+      }
+    }
+    return dst;
+  }
+
+  function processRawMask(raw, w, h) {
+    const EXPAND = maskExpand;
+    const BLUR = maskBlur;
+    if (EXPAND === 0 && BLUR === 0) {
+      return raw.slice();
+    }
+
+    let source = raw;
+    if (EXPAND > 0) {
+      source = dilateOp(raw, w, h, expandSpans);
+    }
+
+    if (BLUR === 0) {
+      return source;
+    }
+
+    return blurOp(source, w, h, blurSpans);
+  }
+
   async function segment(canvas) {
     await waitForBody();
     const seg = await loadSegmenter();
@@ -285,19 +395,24 @@
     }
     const mask = result.categoryMask;
     const w = canvas.width, h = canvas.height;
-    const maskAlpha = new Uint8Array(w * h);
+    let raw = null;
     if (mask) {
       const maskData = mask.getAsUint8Array();
+      raw = new Uint8Array(w * h);
       for (let i = 0; i < maskData.length; i++) {
-        maskAlpha[i] = maskData[i] > 0 ? 255 : 0;
+        raw[i] = maskData[i] > 0 ? 255 : 0;
       }
       result.close();
     }
-    return { maskAlpha, w, h };
+    const maskAlpha = raw ? processRawMask(raw, w, h) : new Uint8Array(w * h);
+    return { maskAlpha, raw, w, h };
   }
 
   // Load segmenter as soon as DOM is ready (MediaPipe needs document.body)
-  if (document.body) {
+  // Skip tiny iframes (tracking pixels, ad beacons)
+  if (window !== window.top && window.innerWidth < 48 && window.innerHeight < 48) {
+    // too small to contain meaningful images
+  } else if (document.body) {
     loadSegmenter();
   } else {
     document.addEventListener("DOMContentLoaded", () => loadSegmenter(), { once: true });
@@ -386,10 +501,10 @@
       canvas.height = bitmap.height;
       canvas.getContext("2d").drawImage(bitmap, 0, 0);
 
-      const { maskAlpha, w, h } = await segment(canvas);
+      const { maskAlpha, raw, w, h } = await segment(canvas);
       const originalPixels = canvas.getContext("2d").getImageData(0, 0, w, h).data.slice();
 
-      const cacheEntry = { originalPixels, maskAlpha, w, h };
+      const cacheEntry = { originalPixels, maskAlpha, raw, w, h };
       segUrlCache.set(fetchUrl, cacheEntry);
       segMaskCache.set(img, cacheEntry);
       segAllElements.add(img);
@@ -416,7 +531,7 @@
     const pixels = originalPixels.slice();
     let rSum = 0, gSum = 0, bSum = 0, count = 0;
     for (let i = 0; i < maskAlpha.length; i++) {
-      if (maskAlpha[i] > 0) {
+      if (maskAlpha[i] < 128) {
         const pi = i * 4;
         rSum += originalPixels[pi];
         gSum += originalPixels[pi + 1];
@@ -424,15 +539,20 @@
         count++;
       }
     }
-    const didPaint = count > 0;
+    const hasPersonPixels = maskAlpha.some((v) => v > 0);
+    const didPaint = hasPersonPixels;
     if (didPaint) {
-      const r = (rSum / count) | 0;
-      const g = (gSum / count) | 0;
-      const b = (bSum / count) | 0;
+      const r = count > 0 ? (rSum / count) | 0 : 128;
+      const g = count > 0 ? (gSum / count) | 0 : 128;
+      const b = count > 0 ? (bSum / count) | 0 : 128;
       for (let i = 0; i < maskAlpha.length; i++) {
         if (maskAlpha[i] > 0) {
           const pi = i * 4;
-          pixels[pi] = r; pixels[pi + 1] = g; pixels[pi + 2] = b; pixels[pi + 3] = 255;
+          const a = maskAlpha[i] / 255;
+          pixels[pi] = originalPixels[pi] * (1 - a) + r * a | 0;
+          pixels[pi + 1] = originalPixels[pi + 1] * (1 - a) + g * a | 0;
+          pixels[pi + 2] = originalPixels[pi + 2] * (1 - a) + b * a | 0;
+          pixels[pi + 3] = 255;
         }
       }
     }
@@ -558,6 +678,15 @@
     });
   }
 
+  function reprocessMasks() {
+    segAllElements.forEach((img) => {
+      const cached = segMaskCache.get(img);
+      if (!cached || !cached.raw) return;
+      cached.maskAlpha = processRawMask(cached.raw, cached.w, cached.h);
+      applyMask(img);
+    });
+  }
+
 
 
   function broadcastState() {
@@ -572,7 +701,12 @@
       if (e.data.grayOn !== undefined) grayOn = e.data.grayOn;
       if (e.data.blurAmount !== undefined) { blurAmount = e.data.blurAmount; blurOff = blurAmount === 0; }
       if (e.data.blurOff !== undefined) blurOff = e.data.blurOff;
+      const maskChanged = (e.data.maskBlur !== undefined && e.data.maskBlur !== maskBlur) ||
+        (e.data.maskExpand !== undefined && e.data.maskExpand !== maskExpand);
+      if (e.data.maskBlur !== undefined) { maskBlur = e.data.maskBlur; blurSpans = circleRowSpans(maskBlur); }
+      if (e.data.maskExpand !== undefined) { maskExpand = e.data.maskExpand; expandSpans = circleRowSpans(maskExpand); }
       applyBlur();
+      if (maskChanged) reprocessMasks();
       broadcastState();
     }
   });
