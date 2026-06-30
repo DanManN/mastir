@@ -727,6 +727,7 @@
       if (!cached || !cached.originalPixels) continue;
       const current = img.src || "";
       if (current.startsWith("data:")) continue;
+      img.style.setProperty("filter", MAX_BLUR, "important");
       const count = srcReapplyCount.get(img) || 0;
       if (count >= MAX_REAPPLIES) continue;
       if (srcReapplyPending.has(img)) continue;
