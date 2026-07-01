@@ -96,6 +96,8 @@
 
   function shouldPreBlur(el) {
     if (el.tagName === "IFRAME") return false;
+    if (el.tagName === "VIDEO" || el.tagName === "VIDEO-JS") return true;
+    if (el.tagName === "IMG") return true;
     if (el.hasAttribute("image-src")) return true;
     const style = el.getAttribute("style");
     if (style && BG_IMG_RE.test(style)) return true;
@@ -111,6 +113,7 @@
 
   // Pre-blur, observe, and recurse into any shadow root on a single element.
   function handleElement(el) {
+    if (el.tagName === "VIDEO") watchVideoPlayback(el);
     if (shouldPreBlur(el)) blurElement(el);
     observeElement(el);
     if (el.shadowRoot) processShadowRoot(el.shadowRoot);
@@ -513,6 +516,31 @@
     }
   }
 
+  // We only segment the poster frame, never playback — so a playing video is
+  // always fully blurred, regardless of what the poster segmentation decided.
+  // Attached at discovery time (before segmentation) so no play() can slip
+  // through unblurred. When paused/ended, restore whatever filter is on the
+  // element (the poster decision from applyMask, or the pre-blur if not yet
+  // processed).
+  // Only the pristine poster frame is segmented. The instant a video plays,
+  // every subsequent frame — including any paused mid-video frame — is
+  // unsegmented and could contain a person, so we blur permanently on first
+  // play and never restore. (The poster's reveal/mask decision only applies
+  // before playback.) Latching this way also avoids the blur flashing on/off
+  // as players cycle play/pause/buffer events.
+  function watchVideoPlayback(video) {
+    if (video.__mastirPlaybackWatched) return;
+    video.__mastirPlaybackWatched = true;
+    const blurForever = () => {
+      video.__mastirPlayed = true;
+      video.style.setProperty("filter", MAX_BLUR, "important");
+    };
+    video.addEventListener("play", blurForever);
+    video.addEventListener("playing", blurForever);
+    video.addEventListener("timeupdate", () => { if (video.currentTime > 0) blurForever(); });
+    if (!video.paused || video.currentTime > 0) blurForever();
+  }
+
   // Paint the masked result as a positioned overlay over the element — used
   // for images we can't repaint in place (direct-view IMG, shadow-DOM custom
   // elements). CSSOM positioning, so it works under strict style-src too.
@@ -604,10 +632,15 @@
       img.src = segOriginalSrc.get(img);
       selfUpdating = false;
     }
-    // Apply the global blur/grayscale preference. For a detected person this
-    // layers on top of the mask paint; for a no-person image it's the only
-    // filter (and is "none" at default settings, so the image is revealed).
-    img.style.setProperty("filter", buildFilter(!blurOff), "important");
+    // Apply the poster-decision filter (global blur/grayscale pref, "none" at
+    // defaults). For a video, only a pristine poster (never played, still at
+    // frame 0) may be revealed — once it has played, it's latched to MAX_BLUR,
+    // because playback frames past the poster are never segmented.
+    if (img.tagName === "VIDEO" && (img.__mastirPlayed || !img.paused || img.currentTime > 0)) {
+      img.style.setProperty("filter", MAX_BLUR, "important");
+    } else {
+      img.style.setProperty("filter", buildFilter(!blurOff), "important");
+    }
     if (didPaint && img.tagName === "IMG" && !img.__mastirOverlayPaint) observeSrc(img);
   }
 
@@ -697,6 +730,9 @@
 
   function applyBlur() {
     segAllElements.forEach((el) => {
+      // A played video is latched to MAX_BLUR — don't reset it here (applyBlur
+      // runs on every DOM mutation, which would fight the playback blur).
+      if (el.tagName === "VIDEO" && el.__mastirPlayed) return;
       el.style.setProperty("filter", buildFilter(!blurOff), "important");
     });
   }
