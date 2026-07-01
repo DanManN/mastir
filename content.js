@@ -109,18 +109,19 @@
 
   const isDirectImageView = document.contentType?.startsWith("image/");
 
+  // Pre-blur, observe, and recurse into any shadow root on a single element.
+  function handleElement(el) {
+    if (shouldPreBlur(el)) blurElement(el);
+    observeElement(el);
+    if (el.shadowRoot) processShadowRoot(el.shadowRoot);
+  }
+
   function processNode(node) {
     if (node.nodeType !== 1) return;
-    if (shouldPreBlur(node)) blurElement(node);
-    observeElement(node);
+    handleElement(node);
     if (node.querySelectorAll) {
-      node.querySelectorAll("*").forEach((child) => {
-        if (shouldPreBlur(child)) blurElement(child);
-        observeElement(child);
-        if (child.shadowRoot) processShadowRoot(child.shadowRoot);
-      });
+      node.querySelectorAll("*").forEach(handleElement);
     }
-    if (node.shadowRoot) processShadowRoot(node.shadowRoot);
   }
 
   function processShadowRoot(root) {
@@ -133,10 +134,7 @@
       style.id = "mastir-blur-style";
       root.prepend(style);
     }
-    root.querySelectorAll("*").forEach((child) => {
-      if (shouldPreBlur(child)) blurElement(child);
-      observeElement(child);
-    });
+    root.querySelectorAll("*").forEach(handleElement);
     new MutationObserver((mutations) => {
       for (const m of mutations) {
         for (const node of m.addedNodes) processNode(node);
@@ -360,25 +358,44 @@
     return bytes;
   }
 
-  // Downscale bitmap to <= MAX_SEG_DIM, segment in the offscreen doc,
-  // return the raw binary mask at the downscaled (seg) resolution.
-  async function segment(bitmap) {
-    const scale = Math.min(1, MAX_SEG_DIM / Math.max(bitmap.width, bitmap.height));
-    const sw = Math.max(1, Math.round(bitmap.width * scale));
-    const sh = Math.max(1, Math.round(bitmap.height * scale));
-    const pixelsB64 = profile("seg.encode", () => {
-      const canvas = document.createElement("canvas");
-      canvas.width = sw;
-      canvas.height = sh;
-      const ctx = canvas.getContext("2d");
-      ctx.drawImage(bitmap, 0, 0, sw, sh);
-      const pixels = ctx.getImageData(0, 0, sw, sh).data;
-      return bytesToBase64(new Uint8Array(pixels.buffer));
-    });
-    const resp = await profileAsync("seg.roundtrip", () => bridgeRequest("mastir-segment", { pixelsB64, w: sw, h: sh }, 20000));
+  // Segment in the offscreen doc. For normal http(s) URLs, send just the URL
+  // and let the offscreen page fetch + downscale full-res (sharper input). For
+  // blob:/data: URLs it can't fetch, downscale here and send the pixels.
+  async function segment(fetchUrl, bitmap) {
+    let payload;
+    if (/^https?:/.test(fetchUrl)) {
+      payload = { url: fetchUrl };
+    } else {
+      payload = profile("seg.encode", () => {
+        const scale = Math.min(1, MAX_SEG_DIM / Math.max(bitmap.width, bitmap.height));
+        const sw = Math.max(1, Math.round(bitmap.width * scale));
+        const sh = Math.max(1, Math.round(bitmap.height * scale));
+        const canvas = document.createElement("canvas");
+        canvas.width = sw;
+        canvas.height = sh;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(bitmap, 0, 0, sw, sh);
+        const pixels = ctx.getImageData(0, 0, sw, sh).data;
+        return { pixelsB64: bytesToBase64(new Uint8Array(pixels.buffer)), w: sw, h: sh };
+      });
+    }
+    const resp = await profileAsync("seg.roundtrip", () => bridgeRequest("mastir-segment", payload, 20000));
     if (resp.error) throw new Error(resp.error);
     const raw = profile("seg.decode", () => resp.rawB64 ? base64ToBytes(resp.rawB64) : null);
-    return { raw, sw, sh };
+    return { raw, sw: resp.w, sh: resp.h };
+  }
+
+  const IMG_URL_ATTR_RE = /\.(jpe?g|png|webp|avif|bmp)(\?|$)/i;
+
+  // Find an image URL stored in any attribute (custom elements like
+  // <adbl-full-bleed-image landscape-src="…"> hold their src off-spec).
+  function attrImageUrl(el) {
+    for (const attr of el.attributes) {
+      const v = attr.value;
+      if (!v || v.includes(" ")) continue;
+      if (/^(https?:|blob:)/.test(v) && IMG_URL_ATTR_RE.test(v)) return v;
+    }
+    return null;
   }
 
   function getImageUrl(el) {
@@ -399,9 +416,10 @@
       const match = bg.match(/url\(["']?([^"')]+)["']?\)/);
       if (match) return match[1];
     }
-    return null;
+    return attrImageUrl(el);
   }
 
+  // Mark an image resolved without a mask (SVG/GIF, too small, or unfetchable).
   function markDone(img) {
     segProcessed.add(img);
     segMaskCache.set(img, { originalPixels: null, maskAlpha: new Uint8Array(0), raw: null, sw: 0, sh: 0, w: 0, h: 0 });
@@ -466,7 +484,7 @@
         tmp.src = fetchUrl;
       });
 
-      const { raw, sw, sh } = await segment(bitmap);
+      const { raw, sw, sh } = await segment(fetchUrl, bitmap);
       const w = bitmap.width, h = bitmap.height;
       const canvas = document.createElement("canvas");
       canvas.width = w;
@@ -493,6 +511,27 @@
         }
       }
     }
+  }
+
+  // Paint the masked result as a positioned overlay over the element — used
+  // for images we can't repaint in place (direct-view IMG, shadow-DOM custom
+  // elements). CSSOM positioning, so it works under strict style-src too.
+  function paintOverlay(el, dataUrl) {
+    let overlay = el.__mastirOverlay;
+    if (!overlay) {
+      overlay = document.createElement("div");
+      Object.assign(overlay.style, {
+        position: "absolute", top: "0", left: "0", width: "100%", height: "100%",
+        pointerEvents: "none", backgroundSize: "cover", backgroundPosition: "center", zIndex: "1",
+      });
+      el.__mastirOverlay = overlay;
+      const parent = el.parentElement;
+      if (parent) {
+        if (getComputedStyle(parent).position === "static") parent.style.position = "relative";
+        parent.insertBefore(overlay, el.nextSibling);
+      }
+    }
+    overlay.style.setProperty("background-image", `url(${dataUrl})`, "important");
   }
 
   function applyMask(img) {
@@ -538,22 +577,8 @@
         ctx.putImageData(new ImageData(new Uint8ClampedArray(pixels), w, h), 0, 0);
         return canvas.toDataURL("image/png");
       });
-      if (img.tagName === "IMG" && isDirectImageView) {
-        let overlay = img.__mastirOverlay;
-        if (!overlay) {
-          overlay = document.createElement("div");
-          Object.assign(overlay.style, {
-            position: "absolute", top: "0", left: "0", width: "100%", height: "100%",
-            pointerEvents: "none", backgroundSize: "100% 100%", zIndex: "1",
-          });
-          img.__mastirOverlay = overlay;
-          const parent = img.parentElement;
-          if (parent) {
-            if (getComputedStyle(parent).position === "static") parent.style.position = "relative";
-            parent.insertBefore(overlay, img.nextSibling);
-          }
-        }
-        overlay.style.setProperty("background-image", `url(${dataUrl})`, "important");
+      if ((img.tagName === "IMG" && isDirectImageView) || img.__mastirOverlayPaint) {
+        paintOverlay(img, dataUrl);
       } else if (img.tagName === "IMG") {
         selfUpdating = true;
         const picture = img.closest("picture");
@@ -579,9 +604,11 @@
       img.src = segOriginalSrc.get(img);
       selfUpdating = false;
     }
-    const filter = buildFilter(!blurOff);
-    img.style.setProperty("filter", filter, "important");
-    if (img.tagName === "IMG") observeSrc(img);
+    // Apply the global blur/grayscale preference. For a detected person this
+    // layers on top of the mask paint; for a no-person image it's the only
+    // filter (and is "none" at default settings, so the image is revealed).
+    img.style.setProperty("filter", buildFilter(!blurOff), "important");
+    if (didPaint && img.tagName === "IMG" && !img.__mastirOverlayPaint) observeSrc(img);
   }
 
 
@@ -632,12 +659,13 @@
       } else {
         if (el.offsetWidth < 48 || el.offsetHeight < 48) continue;
         const bg = getComputedStyle(el).backgroundImage;
-        if (!bg || bg === "none") continue;
-        // The bg may layer gradients before a url() (e.g. a tinted photo),
-        // so look for a url() anywhere rather than rejecting on prefix.
-        const match = bg.match(/url\(["']?([^"')]+)["']?\)/);
-        if (!match) continue;
-        if (/\.(svg|gif)(\?|$)/i.test(match[1])) continue;
+        const match = bg && bg !== "none" ? bg.match(/url\(["']?([^"')]+)["']?\)/) : null;
+        const url = match ? match[1] : attrImageUrl(el);
+        if (!url) continue;
+        if (/\.(svg|gif)(\?|$)/i.test(url)) continue;
+        // Custom elements that render their image in shadow DOM can't be
+        // repainted via a host background — flag them for an overlay.
+        if (!match) el.__mastirOverlayPaint = true;
         blurElement(el);
         enqueueImage(el);
       }
@@ -706,10 +734,14 @@
     }
   });
 
-  // Watch for external JS overwriting src on images we've already masked
+  // Watch for external JS (e.g. Amazon carousels) overwriting src on images
+  // we've masked. On the first couple of overwrites we re-mask in place; if it
+  // keeps churning we switch the image to overlay mode — restore its real src
+  // and paint the mask as an overlay on top, so the page can rewrite src
+  // freely without fighting us.
   const srcReapplyCount = new WeakMap();
   const srcReapplyPending = new WeakSet();
-  const MAX_REAPPLIES = 5;
+  const MAX_INPLACE_REAPPLIES = 2;
   let selfUpdating = false;
 
   const srcObserver = new MutationObserver((mutations) => {
@@ -717,21 +749,29 @@
     for (const m of mutations) {
       if (m.type !== "attributes") continue;
       const img = m.target;
+      if (img.__mastirOverlayPaint) continue; // already overlay-mode
       if (!segMaskCache.has(img)) continue;
       const cached = segMaskCache.get(img);
       if (!cached || !cached.originalPixels) continue;
       const current = img.src || "";
       if (current.startsWith("data:")) continue;
       img.style.setProperty("filter", MAX_BLUR, "important");
-      const count = srcReapplyCount.get(img) || 0;
-      if (count >= MAX_REAPPLIES) continue;
       if (srcReapplyPending.has(img)) continue;
+      const count = srcReapplyCount.get(img) || 0;
       srcReapplyPending.add(img);
       srcReapplyCount.set(img, count + 1);
       requestAnimationFrame(() => {
         srcReapplyPending.delete(img);
-        const cur = img.src || "";
-        if (!cur.startsWith("data:") && segMaskCache.has(img)) {
+        if (!segMaskCache.has(img)) return;
+        if (count >= MAX_INPLACE_REAPPLIES) {
+          // Churning image: switch to overlay mode permanently.
+          img.__mastirOverlayPaint = true;
+          srcObserver.unobserve(img);
+          img.style.setProperty("filter", buildFilter(!blurOff), "important");
+          selfUpdating = true;
+          applyMask(img);
+          selfUpdating = false;
+        } else if (!(img.src || "").startsWith("data:")) {
           selfUpdating = true;
           applyMask(img);
           selfUpdating = false;

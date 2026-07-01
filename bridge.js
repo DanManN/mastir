@@ -25,11 +25,11 @@ window.addEventListener("message", (e) => {
   }
 
   if (e.data?.type === "mastir-segment") {
-    const { id, pixelsB64, w, h } = e.data;
+    const { id, url, pixelsB64, w, h } = e.data;
     // Ensure the offscreen doc exists (once), then message it directly —
     // skipping a background relay hop each way.
     offscreenReady()
-      .then(() => chrome.runtime.sendMessage({ type: "mastir-segment-offscreen", pixelsB64, w, h }))
+      .then(() => chrome.runtime.sendMessage({ type: "mastir-segment-offscreen", url, pixelsB64, w, h }))
       .then((response) => {
         window.postMessage({ type: "mastir-segment-response", id, rawB64: response.rawB64, w: response.w, h: response.h, error: response.error }, "*");
       })

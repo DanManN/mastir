@@ -1,9 +1,12 @@
 "use strict";
 
 // Runs MediaPipe segmentation on the GPU inside an extension-owned page,
-// so the host page's CSP never applies. Receives downscaled RGBA pixels,
-// returns a raw binary person-mask.
+// so the host page's CSP never applies. Accepts either an image URL (fetched
+// and downscaled here, for sharper input) or pre-downscaled RGBA pixels
+// (blob:/data: images the offscreen doc can't fetch). Returns a raw binary
+// person-mask at the downscaled resolution.
 
+const MAX_SEG_DIM = 256;
 let segmenter = null;
 let segLoading = null;
 
@@ -47,32 +50,49 @@ function bytesToBase64(bytes) {
   return btoa(binary);
 }
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg.type !== "mastir-segment-offscreen") return false;
-  (async () => {
-    const seg = await loadSegmenter();
-    const { pixelsB64, w, h } = msg;
-    const tDecode = performance.now();
+  // Build a segmentation-ready bitmap (downscaled to <= MAX_SEG_DIM) from a URL.
+  async function bitmapFromUrl(url) {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const blob = await resp.blob();
+    const full = await createImageBitmap(blob);
+    const scale = Math.min(1, MAX_SEG_DIM / Math.max(full.width, full.height));
+    const sw = Math.max(1, Math.round(full.width * scale));
+    const sh = Math.max(1, Math.round(full.height * scale));
+    if (scale === 1) return { bitmap: full, sw, sh };
+    const scaled = await createImageBitmap(full, { resizeWidth: sw, resizeHeight: sh, resizeQuality: "high" });
+    full.close();
+    return { bitmap: scaled, sw, sh };
+  }
+
+  // Build a bitmap from pre-downscaled RGBA pixels (blob:/data: fallback).
+  async function bitmapFromPixels(pixelsB64, w, h) {
     const rgba = base64ToBytes(pixelsB64);
     const imageData = new ImageData(new Uint8ClampedArray(rgba.buffer), w, h);
-    const bitmap = await createImageBitmap(imageData);
-    const tInfer = performance.now();
-    const result = seg.segment(bitmap);
-    bitmap.close();
-    const mask = result.categoryMask;
-    let raw = null;
-    if (mask) {
-      const maskData = mask.getAsUint8Array();
-      raw = new Uint8Array(w * h);
-      for (let i = 0; i < maskData.length; i++) raw[i] = maskData[i] > 0 ? 255 : 0;
-      result.close();
-    }
-    const tEnd = performance.now();
-    console.log(`[mastir/offscreen] decode+bitmap=${(tInfer - tDecode).toFixed(1)}ms infer+read=${(tEnd - tInfer).toFixed(1)}ms (${w}x${h})`);
-    sendResponse({ rawB64: raw ? bytesToBase64(raw) : null, w, h });
-  })().catch((e) => {
-    console.warn("[mastir/offscreen] segment failed:", e.message);
-    sendResponse({ error: e.message });
+    return { bitmap: await createImageBitmap(imageData), sw: w, sh: h };
+  }
+
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (msg.type !== "mastir-segment-offscreen") return false;
+    (async () => {
+      const seg = await loadSegmenter();
+      const { bitmap, sw, sh } = msg.url
+        ? await bitmapFromUrl(msg.url)
+        : await bitmapFromPixels(msg.pixelsB64, msg.w, msg.h);
+      const result = seg.segment(bitmap);
+      bitmap.close();
+      const mask = result.categoryMask;
+      let raw = null;
+      if (mask) {
+        const maskData = mask.getAsUint8Array();
+        raw = new Uint8Array(sw * sh);
+        for (let i = 0; i < maskData.length; i++) raw[i] = maskData[i] > 0 ? 255 : 0;
+        result.close();
+      }
+      sendResponse({ rawB64: raw ? bytesToBase64(raw) : null, w: sw, h: sh });
+    })().catch((e) => {
+      console.warn("[mastir/offscreen] segment failed:", e.message);
+      sendResponse({ error: e.message });
+    });
+    return true;
   });
-  return true;
-});
