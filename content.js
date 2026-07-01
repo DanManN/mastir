@@ -194,26 +194,81 @@
     if (!cached || !cached.originalPixels) { console.warn("[mastir] no cached mask for element", img); return; }
     const { originalPixels, maskAlpha, w, h } = cached;
     const out = new Uint8ClampedArray(originalPixels);
+    // Tint red where the mask is set, and track its bounding box.
+    let minX = w, minY = h, maxX = -1, maxY = -1;
     for (let i = 0; i < maskAlpha.length; i++) {
       const a = maskAlpha[i] / 255;
       if (a > 0) {
         const pi = i * 4;
-        out[pi] = out[pi] * (1 - a) + 255 * a;      // tint red where mask is set
+        out[pi] = out[pi] * (1 - a) + 255 * a;
         out[pi + 1] = out[pi + 1] * (1 - a);
         out[pi + 2] = out[pi + 2] * (1 - a);
+        const x = i % w, y = (i / w) | 0;
+        if (x < minX) minX = x; if (x > maxX) maxX = x;
+        if (y < minY) minY = y; if (y > maxY) maxY = y;
       }
     }
     const c = document.createElement("canvas");
     c.width = w; c.height = h;
-    c.getContext("2d").putImageData(new ImageData(out, w, h), 0, 0);
+    const cctx = c.getContext("2d");
+    cctx.putImageData(new ImageData(out, w, h), 0, 0);
+    // Draw a lime outline around the mask's bounding box (its extent within the
+    // image), so alignment vs. the person is obvious.
+    if (maxX >= 0) {
+      cctx.strokeStyle = "#00ff00";
+      cctx.lineWidth = Math.max(2, Math.round(Math.max(w, h) / 200));
+      cctx.strokeRect(minX + 0.5, minY + 0.5, maxX - minX, maxY - minY);
+      console.log(`[mastir] mask bbox x[${minX}-${maxX}] y[${minY}-${maxY}] of image ${w}x${h}`);
+    } else {
+      console.log("[mastir] mask is EMPTY (no person pixels)");
+    }
     console.log(`[mastir] mask ${cached.sw}x${cached.sh} -> image ${w}x${h}`, img);
     // Chrome blocks top-level navigation to data: URLs, so pin the canvas over
-    // everything on the page instead. Click it to dismiss.
+    // everything on the page instead. Click it to dismiss. Cyan frame = image
+    // bounds (distinct from the lime mask-extent box drawn inside).
     c.style.cssText = "position:fixed;top:20px;left:20px;z-index:2147483647;" +
-      "max-width:90vw;max-height:90vh;border:3px solid red;background:#000;cursor:pointer;box-shadow:0 0 30px #000";
+      "max-width:90vw;max-height:90vh;border:3px solid #00e5ff;background:#000;cursor:pointer;box-shadow:0 0 30px #000";
     c.title = "Mastir mask debug — click to close";
     c.addEventListener("click", () => c.remove());
     document.body.appendChild(c);
+
+    // Second canvas: the RAW seg mask at its own native sw x sh, so its shape
+    // can be compared apples-to-apples against the image aspect ratio. If the
+    // raw mask's aspect differs from the image's, the model saw a distorted
+    // (squished) image — that's the "weird resolution" failure mode.
+    if (cached.raw && cached.sw && cached.sh) {
+      const rc = document.createElement("canvas");
+      rc.width = cached.sw; rc.height = cached.sh;
+      const rctx = rc.getContext("2d");
+      // Draw the ORIGINAL image downscaled to the raw mask's native size, so the
+      // mask can be checked against real content at the exact resolution the
+      // model produced it.
+      const oc = document.createElement("canvas");
+      oc.width = w; oc.height = h;
+      oc.getContext("2d").putImageData(new ImageData(new Uint8ClampedArray(originalPixels), w, h), 0, 0);
+      rctx.imageSmoothingEnabled = true;
+      rctx.drawImage(oc, 0, 0, cached.sw, cached.sh);
+      // Paint the raw mask as solid red (not transparent) on top of the
+      // downscaled original.
+      const rimg = rctx.getImageData(0, 0, cached.sw, cached.sh);
+      for (let i = 0; i < cached.raw.length; i++) {
+        if (cached.raw[i] > 0) {
+          const pi = i * 4;
+          rimg.data[pi] = 255;
+          rimg.data[pi + 1] = 0;
+          rimg.data[pi + 2] = 0;
+        }
+      }
+      rctx.putImageData(rimg, 0, 0);
+      rc.style.cssText = "position:fixed;top:20px;right:20px;z-index:2147483647;" +
+        "max-width:45vw;max-height:90vh;border:3px solid #ffb300;background:#000;cursor:pointer;" +
+        "image-rendering:pixelated;box-shadow:0 0 30px #000";
+      rc.title = "Mastir RAW mask (native sw x sh) — click to close";
+      rc.addEventListener("click", () => rc.remove());
+      document.body.appendChild(rc);
+      const imgAspect = (w / h).toFixed(3), maskAspect = (cached.sw / cached.sh).toFixed(3);
+      console.log(`[mastir] aspect  image=${imgAspect}  rawMask=${maskAspect}  ${imgAspect === maskAspect ? "(match)" : "(DIFFERENT — mask distorted vs image)"}`);
+    }
     // Also emit a blob URL (not blocked like data:) in case you want it in a tab.
     c.toBlob((b) => console.log("[mastir] mask preview blob:", URL.createObjectURL(b)));
   };
