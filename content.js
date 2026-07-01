@@ -3,6 +3,8 @@
 (function () {
   if (document.contentType?.includes("svg")) return;
 
+  const BLUR_CSS = "img, video, video-js, [image-src] { filter: blur(20px) grayscale(100%) !important; clip-path: inset(0); }";
+
   // Inject a CSS rule immediately so images are blurred/grayscaled before they even render
   let styleInjected = false;
   let styleFailed = false;
@@ -13,18 +15,68 @@
     style.id = "mastir-blur-style";
     const existingNonce = document.querySelector("style[nonce], script[nonce]");
     if (existingNonce) style.nonce = existingNonce.nonce || existingNonce.getAttribute("nonce");
-    style.textContent = "img, video, video-js, [image-src] { filter: blur(20px) grayscale(100%) !important; clip-path: inset(0); }";
+    style.textContent = BLUR_CSS;
     (document.head || document.documentElement).appendChild(style);
     if (!style.sheet || style.sheet.cssRules.length === 0) {
       style.remove();
-      if (document.head) {
-        styleFailed = true;
-        promptCspStrip();
-      }
+      // Stylesheet blocked by CSP (style-src). Per-element blur via CSSOM
+      // (element.style.setProperty) still works and isn't governed by CSP,
+      // but it can't pre-empt the initial paint the way a global rule does —
+      // so cover the page until we've blurred everything, then reveal.
+      if (document.head) { styleFailed = true; showCover(); scheduleReveal(); }
     } else {
       styleInjected = true;
     }
   }
+
+  // Opaque cover shown on strict-CSP sites (where the blur stylesheet is
+  // rejected) to prevent a flash of unblurred images during initial parse.
+  // Positioned via CSSOM, which CSP's style-src does not govern.
+  let coverEl = null;
+  function showCover() {
+    if (coverEl) return;
+    coverEl = document.createElement("div");
+    const s = coverEl.style;
+    s.setProperty("position", "fixed", "important");
+    s.setProperty("top", "0", "important");
+    s.setProperty("left", "0", "important");
+    s.setProperty("width", "100vw", "important");
+    s.setProperty("height", "100vh", "important");
+    s.setProperty("background", "#1a1a1a", "important");
+    s.setProperty("z-index", "2147483647", "important");
+    s.setProperty("display", "flex", "important");
+    s.setProperty("align-items", "center", "important");
+    s.setProperty("justify-content", "center", "important");
+    s.setProperty("color", "#888", "important");
+    s.setProperty("font-family", "sans-serif", "important");
+    s.setProperty("font-size", "14px", "important");
+    coverEl.textContent = "Mastir: concealing images…";
+    (document.body || document.documentElement).appendChild(coverEl);
+  }
+  function hideCover() {
+    if (coverEl) { coverEl.remove(); coverEl = null; }
+  }
+
+  // Once the stylesheet is known-rejected, blur every current image via CSSOM
+  // then lift the cover. Later images are handled by the top-level observer.
+  let revealScheduled = false;
+  function scheduleReveal() {
+    if (revealScheduled) return;
+    revealScheduled = true;
+    const doReveal = () => {
+      document.querySelectorAll("img, video, video-js, [image-src]").forEach((el) => {
+        if (!isVideoIframe(el)) blurElement(el);
+      });
+      hideCover();
+    };
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", doReveal, { once: true });
+    } else {
+      doReveal();
+    }
+    setTimeout(hideCover, 5000); // safety net
+  }
+
   tryInjectStyle();
   if (!styleInjected && !styleFailed) {
     new MutationObserver((_, obs) => {
@@ -44,7 +96,7 @@
 
   function shouldPreBlur(el) {
     if (el.tagName === "IFRAME") return false;
-    if (el.hasAttribute && el.hasAttribute("image-src")) return true;
+    if (el.hasAttribute("image-src")) return true;
     const style = el.getAttribute("style");
     if (style && BG_IMG_RE.test(style)) return true;
     return false;
@@ -58,7 +110,6 @@
   const isDirectImageView = document.contentType?.startsWith("image/");
 
   function processNode(node) {
-    if (styleFailed) return;
     if (node.nodeType !== 1) return;
     if (shouldPreBlur(node)) blurElement(node);
     observeElement(node);
@@ -73,9 +124,12 @@
   }
 
   function processShadowRoot(root) {
-    const style = document.createElement("style");
-    style.textContent = "img, video, [image-src] { filter: blur(20px) grayscale(100%) !important; clip-path: inset(0); }";
-    if (!root.querySelector("#mastir-blur-style")) {
+    // Skip the <style> injection when we already know the page's style-src
+    // rejects it — it would just emit a CSP violation per shadow root.
+    // Per-element blurElement below covers those images either way.
+    if (!styleFailed && !root.querySelector("#mastir-blur-style")) {
+      const style = document.createElement("style");
+      style.textContent = BLUR_CSS;
       style.id = "mastir-blur-style";
       root.prepend(style);
     }
@@ -97,6 +151,34 @@
   }).observe(document.documentElement, { childList: true, subtree: true });
 
   const MAX_BLUR = "blur(20px) grayscale(100%)";
+
+  // --- Profiling ---
+  const MASTIR_PROFILE = true;
+  const profileStats = {};
+  function profile(label, fn) {
+    if (!MASTIR_PROFILE) return fn();
+    const t0 = performance.now();
+    const r = fn();
+    const dt = performance.now() - t0;
+    const s = profileStats[label] || (profileStats[label] = { n: 0, total: 0, max: 0 });
+    s.n++; s.total += dt; s.max = Math.max(s.max, dt);
+    return r;
+  }
+  async function profileAsync(label, fn) {
+    if (!MASTIR_PROFILE) return fn();
+    const t0 = performance.now();
+    const r = await fn();
+    const dt = performance.now() - t0;
+    const s = profileStats[label] || (profileStats[label] = { n: 0, total: 0, max: 0 });
+    s.n++; s.total += dt; s.max = Math.max(s.max, dt);
+    return r;
+  }
+  if (MASTIR_PROFILE) {
+    window.mastirProfile = () => {
+      console.table(Object.fromEntries(Object.entries(profileStats).map(([k, s]) =>
+        [k, { calls: s.n, avgMs: +(s.total / s.n).toFixed(2), maxMs: +s.max.toFixed(2), totalMs: +s.total.toFixed(1) }])));
+    };
+  }
 
   let blurAmount = 0;
   let blurOff = true;
@@ -136,165 +218,14 @@
   }
 
   function crossFetch(url) {
-    return bridgeRequest("mastir-fetch", { url }).then((r) => r.dataUrl);
-  }
-
-  // --- GPU segmenter (CDN → bundled fallback) ---
-  let segmenter = null;
-  let segLoading = null;
-  let segFailed = false;
-  let bundledVisionUrl = null;
-  let bundledWasmUrl = null;
-  let bundledModelUrl = null;
-
-  window.addEventListener("message", (e) => {
-    if (e.source === window && e.data?.type === "mastir-extension-urls") {
-      bundledModelUrl = e.data.modelUrl;
-      bundledVisionUrl = e.data.visionUrl;
-      bundledWasmUrl = e.data.wasmUrl;
-    }
-  });
-
-  let cspPrompted = false;
-
-  function promptCspStrip() {
-    if (cspPrompted) return;
-    cspPrompted = true;
-    const domain = location.hostname;
-    showCspBanner(domain);
-  }
-
-  function showCspBanner(domain) {
-    const banner = document.createElement("div");
-    Object.assign(banner.style, {
-      position: "fixed", top: "10px", right: "10px", zIndex: "99999",
-      background: "#333", color: "#fff", padding: "12px 16px",
-      borderRadius: "8px", fontSize: "14px", maxWidth: "320px",
-      boxShadow: "0 4px 12px rgba(0,0,0,0.3)", fontFamily: "sans-serif",
-    });
-    const title = document.createElement("span");
-    title.textContent = "Mastir";
-    Object.assign(title.style, { fontWeight: "bold" });
-    banner.appendChild(title);
-    banner.appendChild(document.createElement("br"));
-    banner.appendChild(document.createElement("br"));
-    const desc = document.createElement("span");
-    desc.textContent = "This site's Content Security Policy prevents image segmentation. To enable Mastir here, the CSP header must be removed for this domain.";
-    banner.appendChild(desc);
-    banner.appendChild(document.createElement("br"));
-    banner.appendChild(document.createElement("br"));
-    const warning = document.createElement("span");
-    Object.assign(warning.style, { color: "#ffa", fontSize: "12px" });
-    warning.textContent = "⚠ This reduces protection against cross-site scripting (XSS) on this site. Only allow on sites you trust.";
-    banner.appendChild(warning);
-    banner.appendChild(document.createElement("br"));
-    banner.appendChild(document.createElement("br"));
-    const btn = document.createElement("button");
-    Object.assign(btn.style, {
-      background: "#047c9d", color: "#fff", border: "none", borderRadius: "4px",
-      padding: "6px 12px", cursor: "pointer", marginRight: "8px",
-    });
-    btn.textContent = "Allow & Reload";
-    btn.onclick = () => {
-      bridgeRequest("mastir-csp-strip", { domain }).then(() => {
-        setTimeout(() => {
-          bridgeRequest("mastir-hard-reload", {}).catch(() => location.reload());
-        }, 300);
-      });
-    };
-    const dismiss = document.createElement("button");
-    Object.assign(dismiss.style, {
-      background: "transparent", color: "#aaa", border: "1px solid #555",
-      borderRadius: "4px", padding: "6px 12px", cursor: "pointer",
-    });
-    dismiss.textContent = "Dismiss";
-    dismiss.onclick = () => banner.remove();
-    banner.appendChild(btn);
-    banner.appendChild(dismiss);
-    if (styleFailed) {
-      document.documentElement.textContent = "";
-      const body = document.createElement("body");
-      const msg = document.createElement("pre");
-      msg.textContent = [
-        "Mastir - Page Hidden",
-        "",
-        "This site's security policy prevents Mastir from blurring images.",
-        "The page content has been hidden to avoid showing unprotected images.",
-        "",
-        "Please acknowledge the banner to continue.",
-        "",
-      ].join("\n");
-      body.appendChild(msg);
-      body.appendChild(banner);
-      document.documentElement.appendChild(body);
-    } else {
-      document.body.appendChild(banner);
-    }
-  }
-
-  function loadSegmenter() {
-    if (segmenter) return Promise.resolve(segmenter);
-    if (segLoading) return segLoading;
-    segLoading = (async () => {
-      let vision, wasmBase, modelPath;
-      try {
-        vision = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0/vision_bundle.mjs");
-        wasmBase = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0/wasm";
-        console.log("[mastir] vision: CDN");
-      } catch (e) {
-        if (!bundledVisionUrl) { segLoading = null; promptCspStrip(); throw e; }
-        vision = await import(bundledVisionUrl);
-        wasmBase = bundledWasmUrl;
-        console.log("[mastir] vision: bundled");
-      }
-      modelPath = bundledModelUrl || "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite";
-      console.log("[mastir] model:", bundledModelUrl ? "bundled" : "CDN");
-
-      async function createSegmenter(wasm) {
-        const wasmFiles = await vision.FilesetResolver.forVisionTasks(wasm);
-        return Promise.race([
-          vision.ImageSegmenter.createFromOptions(wasmFiles, {
-            baseOptions: { modelAssetPath: modelPath, delegate: "GPU" },
-            runningMode: "IMAGE",
-            outputCategoryMask: true,
-            outputConfidenceMasks: false,
-          }),
-          new Promise((_, reject) => setTimeout(() => reject(new Error("WASM init timeout (CSP blocked)")), 10000)),
-        ]);
-      }
-
-      try {
-        segmenter = await createSegmenter(wasmBase);
-        console.log("[mastir] wasm:", wasmBase.startsWith("chrome-extension") ? "bundled" : "CDN");
-      } catch (e) {
-        if (!bundledWasmUrl || wasmBase === bundledWasmUrl) throw e;
-        console.log("[mastir] wasm CDN failed, falling back to bundled");
-        segmenter = await createSegmenter(bundledWasmUrl);
-        console.log("[mastir] wasm: bundled (fallback)");
-      }
-      console.log("[mastir] segmenter ready");
-      return segmenter;
-    })().catch((e) => {
-      segFailed = true;
-      console.warn("[mastir] segmenter failed permanently:", e.message);
-      if (/CSP|Content Security Policy|Trusted|blocked|timeout|Assertion|Aborted|wasm/i.test(e.message)) {
-        if (!document.querySelector('meta[http-equiv="Content-Security-Policy"]')) {
-          promptCspStrip();
-        } else {
-          console.log("[mastir] meta CSP detected, cannot strip — images will stay blurred");
-        }
-      }
-    });
-    return segLoading;
-  }
-
-  function waitForBody() {
-    if (document.body) return Promise.resolve();
-    return new Promise((resolve) => {
-      const check = () => document.body ? resolve() : requestAnimationFrame(check);
-      check();
+    return bridgeRequest("mastir-fetch", { url }).then((r) => {
+      if (r.error || !r.dataUrl) throw new Error(r.error || "fetch failed");
+      return r.dataUrl;
     });
   }
+
+  // Segmentation runs in an offscreen extension page (GPU, own CSP).
+  const MAX_SEG_DIM = 256;
 
   function circleRowSpans(radius) {
     const spans = [];
@@ -382,43 +313,78 @@
     return blurOp(source, w, h, blurSpans);
   }
 
-  async function segment(canvas) {
-    await waitForBody();
-    const seg = await loadSegmenter();
-    if (!seg) throw new Error("segmenter unavailable");
-    let result;
-    try {
-      result = seg.segment(canvas);
-    } catch (e) {
-      await waitForBody();
-      result = seg.segment(canvas);
+  // Upscale a single-channel mask from (sw,sh) to (w,h) with bilinear smoothing.
+  function upscaleMask(mask, sw, sh, w, h) {
+    if (sw === w && sh === h) return mask;
+    const src = document.createElement("canvas");
+    src.width = sw; src.height = sh;
+    const sctx = src.getContext("2d");
+    const img = sctx.createImageData(sw, sh);
+    for (let i = 0; i < mask.length; i++) {
+      const pi = i * 4;
+      img.data[pi] = img.data[pi + 1] = img.data[pi + 2] = mask[i];
+      img.data[pi + 3] = 255;
     }
-    const mask = result.categoryMask;
-    const w = canvas.width, h = canvas.height;
-    let raw = null;
-    if (mask) {
-      const maskData = mask.getAsUint8Array();
-      raw = new Uint8Array(w * h);
-      for (let i = 0; i < maskData.length; i++) {
-        raw[i] = maskData[i] > 0 ? 255 : 0;
-      }
-      result.close();
-    }
-    const maskAlpha = raw ? processRawMask(raw, w, h) : new Uint8Array(w * h);
-    return { maskAlpha, raw, w, h };
+    sctx.putImageData(img, 0, 0);
+    const dst = document.createElement("canvas");
+    dst.width = w; dst.height = h;
+    const dctx = dst.getContext("2d");
+    dctx.imageSmoothingEnabled = true;
+    dctx.drawImage(src, 0, 0, w, h);
+    const out = new Uint8Array(w * h);
+    const data = dctx.getImageData(0, 0, w, h).data;
+    for (let i = 0; i < out.length; i++) out[i] = data[i * 4];
+    return out;
   }
 
-  // Load segmenter as soon as DOM is ready (MediaPipe needs document.body)
-  // Skip tiny iframes (tracking pixels, ad beacons)
-  if (window !== window.top && window.innerWidth < 48 && window.innerHeight < 48) {
-    // too small to contain meaningful images
-  } else if (document.body) {
-    loadSegmenter();
-  } else {
-    document.addEventListener("DOMContentLoaded", () => loadSegmenter(), { once: true });
+  // Process the raw seg-res mask (dilate + blur) then upscale to display res.
+  function buildMaskAlpha(entry) {
+    if (!entry.raw) return new Uint8Array(entry.w * entry.h);
+    const small = profile("mask.dilateBlur", () => processRawMask(entry.raw, entry.sw, entry.sh));
+    return profile("mask.upscale", () => upscaleMask(small, entry.sw, entry.sh, entry.w, entry.h));
+  }
+
+  function bytesToBase64(bytes) {
+    let binary = "";
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    }
+    return btoa(binary);
+  }
+
+  function base64ToBytes(b64) {
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+
+  // Downscale bitmap to <= MAX_SEG_DIM, segment in the offscreen doc,
+  // return the raw binary mask at the downscaled (seg) resolution.
+  async function segment(bitmap) {
+    const scale = Math.min(1, MAX_SEG_DIM / Math.max(bitmap.width, bitmap.height));
+    const sw = Math.max(1, Math.round(bitmap.width * scale));
+    const sh = Math.max(1, Math.round(bitmap.height * scale));
+    const pixelsB64 = profile("seg.encode", () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = sw;
+      canvas.height = sh;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(bitmap, 0, 0, sw, sh);
+      const pixels = ctx.getImageData(0, 0, sw, sh).data;
+      return bytesToBase64(new Uint8Array(pixels.buffer));
+    });
+    const resp = await profileAsync("seg.roundtrip", () => bridgeRequest("mastir-segment", { pixelsB64, w: sw, h: sh }, 20000));
+    if (resp.error) throw new Error(resp.error);
+    const raw = profile("seg.decode", () => resp.rawB64 ? base64ToBytes(resp.rawB64) : null);
+    return { raw, sw, sh };
   }
 
   function getImageUrl(el) {
+    if (el.tagName === "VIDEO") {
+      return el.getAttribute("poster") || null;
+    }
     const srcset = el.getAttribute("srcset");
     if (srcset) {
       const first = srcset.trim().split(/,\s*(?=https?:\/\/)/)[0];
@@ -438,17 +404,18 @@
 
   function markDone(img) {
     segProcessed.add(img);
-    segMaskCache.set(img, { originalPixels: null, maskAlpha: new Uint8Array(0), w: 0, h: 0 });
+    segMaskCache.set(img, { originalPixels: null, maskAlpha: new Uint8Array(0), raw: null, sw: 0, sh: 0, w: 0, h: 0 });
     segAllElements.add(img);
     img.style.setProperty("filter", buildFilter(!blurOff), "important");
   }
 
   async function processImage(img) {
-    if (segFailed) return;
     if (segProcessed.has(img)) return;
     if (isVideoIframe(img)) { segProcessed.add(img); return; }
     const imageSrcAttr = img.getAttribute("image-src");
-    const src = imageSrcAttr || img.currentSrc || img.src || getImageUrl(img);
+    const src = img.tagName === "VIDEO"
+      ? getImageUrl(img)
+      : (imageSrcAttr || img.currentSrc || img.src || getImageUrl(img));
     if (!src) return;
     if (img.tagName === "IMG" && !imageSrcAttr) {
       if (img.naturalWidth === 0 || img.naturalHeight === 0) {
@@ -475,7 +442,9 @@
 
       if (segUrlCache.has(fetchUrl)) {
         const cached = segUrlCache.get(fetchUrl);
-        segMaskCache.set(img, { originalPixels: cached.originalPixels.slice(), maskAlpha: cached.maskAlpha, w: cached.w, h: cached.h });
+        const entry = { originalPixels: cached.originalPixels.slice(), raw: cached.raw, sw: cached.sw, sh: cached.sh, w: cached.w, h: cached.h };
+        entry.maskAlpha = buildMaskAlpha(entry);
+        segMaskCache.set(img, entry);
         segAllElements.add(img);
         applyMask(img);
         return;
@@ -496,15 +465,17 @@
         };
         tmp.src = fetchUrl;
       });
-      const canvas = document.createElement("canvas");
-      canvas.width = bitmap.width;
-      canvas.height = bitmap.height;
-      canvas.getContext("2d").drawImage(bitmap, 0, 0);
 
-      const { maskAlpha, raw, w, h } = await segment(canvas);
+      const { raw, sw, sh } = await segment(bitmap);
+      const w = bitmap.width, h = bitmap.height;
+      const canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+      canvas.getContext("2d").drawImage(bitmap, 0, 0);
       const originalPixels = canvas.getContext("2d").getImageData(0, 0, w, h).data.slice();
 
-      const cacheEntry = { originalPixels, maskAlpha, raw, w, h };
+      const cacheEntry = { originalPixels, raw, sw, sh, w, h };
+      cacheEntry.maskAlpha = buildMaskAlpha(cacheEntry);
       segUrlCache.set(fetchUrl, cacheEntry);
       segMaskCache.set(img, cacheEntry);
       segAllElements.add(img);
@@ -529,19 +500,20 @@
     if (!cached || !cached.originalPixels) return;
     const { originalPixels, maskAlpha, w, h } = cached;
     const pixels = originalPixels.slice();
-    let rSum = 0, gSum = 0, bSum = 0, count = 0;
-    for (let i = 0; i < maskAlpha.length; i++) {
-      if (maskAlpha[i] < 128) {
-        const pi = i * 4;
-        rSum += originalPixels[pi];
-        gSum += originalPixels[pi + 1];
-        bSum += originalPixels[pi + 2];
-        count++;
+    const didPaint = profile("paint.blend", () => {
+      let rSum = 0, gSum = 0, bSum = 0, count = 0;
+      let hasPersonPixels = false;
+      for (let i = 0; i < maskAlpha.length; i++) {
+        if (maskAlpha[i] > 0) hasPersonPixels = true;
+        if (maskAlpha[i] < 128) {
+          const pi = i * 4;
+          rSum += originalPixels[pi];
+          gSum += originalPixels[pi + 1];
+          bSum += originalPixels[pi + 2];
+          count++;
+        }
       }
-    }
-    const hasPersonPixels = maskAlpha.some((v) => v > 0);
-    const didPaint = hasPersonPixels;
-    if (didPaint) {
+      if (!hasPersonPixels) return false;
       const r = count > 0 ? (rSum / count) | 0 : 128;
       const g = count > 0 ? (gSum / count) | 0 : 128;
       const b = count > 0 ? (bSum / count) | 0 : 128;
@@ -555,14 +527,17 @@
           pixels[pi + 3] = 255;
         }
       }
-    }
+      return true;
+    });
     if (didPaint) {
-      const canvas = document.createElement("canvas");
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext("2d");
-      ctx.putImageData(new ImageData(new Uint8ClampedArray(pixels), w, h), 0, 0);
-      const dataUrl = canvas.toDataURL("image/png");
+      const dataUrl = profile("paint.toDataURL", () => {
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext("2d");
+        ctx.putImageData(new ImageData(new Uint8ClampedArray(pixels), w, h), 0, 0);
+        return canvas.toDataURL("image/png");
+      });
       if (img.tagName === "IMG" && isDirectImageView) {
         let overlay = img.__mastirOverlay;
         if (!overlay) {
@@ -586,8 +561,18 @@
         img.removeAttribute("srcset");
         img.src = dataUrl;
         selfUpdating = false;
+      } else if (img.tagName === "VIDEO") {
+        img.setAttribute("poster", dataUrl);
       } else {
-        img.style.setProperty("background-image", `url(${dataUrl})`, "important");
+        // Background may layer gradients over the image url(); swap only the
+        // url() so any decorative gradient tint is preserved.
+        const origBg = getComputedStyle(img).backgroundImage;
+        if (origBg && /url\(/.test(origBg) && /gradient/.test(origBg)) {
+          const newBg = origBg.replace(/url\(["']?[^"')]+["']?\)/, `url(${dataUrl})`);
+          img.style.setProperty("background-image", newBg, "important");
+        } else {
+          img.style.setProperty("background-image", `url(${dataUrl})`, "important");
+        }
       }
     } else if (img.tagName === "IMG" && segOriginalSrc.has(img)) {
       selfUpdating = true;
@@ -602,11 +587,10 @@
 
 
   const segQueue = [];
-  let segRunning = false;
+  const SEG_CONCURRENCY = 2;
+  let segWorkers = 0;
 
-  async function processQueue() {
-    if (segRunning) return;
-    segRunning = true;
+  async function segWorker() {
     while (segQueue.length > 0) {
       const img = segQueue.shift();
       if (segMaskCache.has(img)) continue;
@@ -616,7 +600,14 @@
         console.error("[mastir] queue error:", e);
       }
     }
-    segRunning = false;
+    segWorkers--;
+  }
+
+  function processQueue() {
+    while (segWorkers < SEG_CONCURRENCY && segWorkers < segQueue.length) {
+      segWorkers++;
+      segWorker();
+    }
   }
 
   function enqueueImage(img) {
@@ -636,11 +627,14 @@
       if (segProcessed.has(el) || segMaskCache.has(el)) continue;
       if (el.tagName === "IMG" || el.hasAttribute("image-src")) {
         enqueueImage(el);
+      } else if (el.tagName === "VIDEO" && el.getAttribute("poster")) {
+        enqueueImage(el);
       } else {
         if (el.offsetWidth < 48 || el.offsetHeight < 48) continue;
         const bg = getComputedStyle(el).backgroundImage;
         if (!bg || bg === "none") continue;
-        if (bg.startsWith("linear-gradient") || bg.startsWith("radial-gradient")) continue;
+        // The bg may layer gradients before a url() (e.g. a tinted photo),
+        // so look for a url() anywhere rather than rejecting on prefix.
         const match = bg.match(/url\(["']?([^"')]+)["']?\)/);
         if (!match) continue;
         if (/\.(svg|gif)(\?|$)/i.test(match[1])) continue;
@@ -660,6 +654,7 @@
   function runSegmentation() {
     document.querySelectorAll("img").forEach(observeElement);
     document.querySelectorAll("[image-src]").forEach(observeElement);
+    document.querySelectorAll("video[poster]").forEach(observeElement);
   }
 
 
@@ -682,7 +677,7 @@
     segAllElements.forEach((img) => {
       const cached = segMaskCache.get(img);
       if (!cached || !cached.raw) return;
-      cached.maskAlpha = processRawMask(cached.raw, cached.w, cached.h);
+      cached.maskAlpha = buildMaskAlpha(cached);
       applyMask(img);
     });
   }
@@ -714,7 +709,7 @@
   // Watch for external JS overwriting src on images we've already masked
   const srcReapplyCount = new WeakMap();
   const srcReapplyPending = new WeakSet();
-  const MAX_REAPPLIES = 3;
+  const MAX_REAPPLIES = 5;
   let selfUpdating = false;
 
   const srcObserver = new MutationObserver((mutations) => {
@@ -750,8 +745,12 @@
     srcObserver.observe(img, { attributes: true, attributeFilter: ["src", "srcset"] });
   }
 
+  // Skip tiny iframes (tracking pixels, ad beacons) — no meaningful images.
+  const isTinyFrame = window !== window.top && window.innerWidth < 48 && window.innerHeight < 48;
+
   let segDebounce = null;
   window.addEventListener("load", () => {
+    if (isTinyFrame) return;
     new MutationObserver(() => {
       applyBlur();
       if (!segDebounce) {

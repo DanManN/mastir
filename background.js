@@ -1,6 +1,24 @@
 "use strict";
 
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+let creatingOffscreen = null;
+
+async function ensureOffscreen() {
+  const has = await chrome.offscreen.hasDocument();
+  if (has) return;
+  if (creatingOffscreen) { await creatingOffscreen; return; }
+  creatingOffscreen = chrome.offscreen.createDocument({
+    url: "offscreen.html",
+    reasons: ["WORKERS"],
+    justification: "GPU person-segmentation of images without touching page CSP",
+  });
+  try {
+    await creatingOffscreen;
+  } finally {
+    creatingOffscreen = null;
+  }
+}
+
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === "fetch") {
     fetch(msg.url)
       .then((r) => {
@@ -17,44 +35,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  if (msg.type === "hard-reload") {
-    const origin = sender.origin || new URL(sender.url).origin;
-    chrome.browsingData.remove({
-      origins: [origin],
-    }, { cacheStorage: true, cache: true, serviceWorkers: true }, () => {
-      chrome.tabs.reload(sender.tab.id, { bypassCache: true }, () => {
-        sendResponse({ status: "reloaded" });
-      });
-    });
-    return true;
-  }
-
-  if (msg.type === "csp-strip-request") {
-    const domain = msg.domain;
-    chrome.declarativeNetRequest.getDynamicRules((rules) => {
-      const existing = rules.find((r) => r.condition.requestDomains?.includes(domain));
-      if (existing) { sendResponse({ status: "already-enabled" }); return; }
-      const id = rules.length > 0 ? Math.max(...rules.map((r) => r.id)) + 1 : 1000;
-      chrome.declarativeNetRequest.updateDynamicRules({
-        addRules: [{
-          id,
-          priority: 1,
-          action: {
-            type: "modifyHeaders",
-            responseHeaders: [
-              { header: "Content-Security-Policy", operation: "remove" },
-              { header: "Content-Security-Policy-Report-Only", operation: "remove" }
-            ]
-          },
-          condition: {
-            requestDomains: [domain],
-            resourceTypes: ["main_frame", "sub_frame"]
-          }
-        }]
-      }, () => {
-        sendResponse({ status: "enabled" });
-      });
-    });
+  if (msg.type === "ensure-offscreen") {
+    ensureOffscreen()
+      .then(() => sendResponse({ ready: true }))
+      .catch((e) => sendResponse({ error: e.message }));
     return true;
   }
 

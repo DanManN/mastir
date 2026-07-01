@@ -1,12 +1,5 @@
 "use strict";
 
-window.postMessage({
-  type: "mastir-extension-urls",
-  modelUrl: chrome.runtime.getURL("selfie_multiclass_256x256.tflite"),
-  visionUrl: chrome.runtime.getURL("vision_bundle.mjs"),
-  wasmUrl: chrome.runtime.getURL("wasm")
-}, "*");
-
 chrome.storage.local.get({ blurAmount: 0, maskBlur: 4, maskExpand: 8, grayOn: false }, (s) => {
   window.postMessage({ type: "mastir-settings", ...s }, "*");
 });
@@ -31,21 +24,27 @@ window.addEventListener("message", (e) => {
     });
   }
 
-  if (e.data?.type === "mastir-hard-reload") {
-    const { id } = e.data;
-    chrome.runtime.sendMessage({ type: "hard-reload" }, () => {
-      window.postMessage({ type: "mastir-hard-reload-response", id }, "*");
-    });
-  }
-
-  if (e.data?.type === "mastir-csp-strip") {
-    const { id, domain } = e.data;
-    chrome.runtime.sendMessage({ type: "csp-strip-request", domain }, (response) => {
-      if (chrome.runtime.lastError) {
-        window.postMessage({ type: "mastir-csp-strip-response", id, error: chrome.runtime.lastError.message }, "*");
-        return;
-      }
-      window.postMessage({ type: "mastir-csp-strip-response", id, status: response.status }, "*");
-    });
+  if (e.data?.type === "mastir-segment") {
+    const { id, pixelsB64, w, h } = e.data;
+    // Ensure the offscreen doc exists (once), then message it directly —
+    // skipping a background relay hop each way.
+    offscreenReady()
+      .then(() => chrome.runtime.sendMessage({ type: "mastir-segment-offscreen", pixelsB64, w, h }))
+      .then((response) => {
+        window.postMessage({ type: "mastir-segment-response", id, rawB64: response.rawB64, w: response.w, h: response.h, error: response.error }, "*");
+      })
+      .catch((err) => {
+        window.postMessage({ type: "mastir-segment-response", id, error: err.message }, "*");
+      });
   }
 });
+
+let offscreenReadyPromise = null;
+function offscreenReady() {
+  if (!offscreenReadyPromise) {
+    offscreenReadyPromise = chrome.runtime.sendMessage({ type: "ensure-offscreen" }).then((r) => {
+      if (r?.error) { offscreenReadyPromise = null; throw new Error(r.error); }
+    });
+  }
+  return offscreenReadyPromise;
+}

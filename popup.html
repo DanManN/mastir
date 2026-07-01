@@ -5,11 +5,6 @@
   body { width: 280px; padding: 12px; font-family: sans-serif; font-size: 13px; color: #333; }
   h3 { margin: 0 0 12px; font-size: 15px; }
   .section { margin-bottom: 12px; }
-  .domain { font-size: 12px; color: #555; padding: 2px 0; }
-  button { color: #fff; border: none; border-radius: 4px; padding: 8px 12px; cursor: pointer; width: 100%; margin-bottom: 6px; }
-  .reset-btn { background: #c0392b; margin-top: 8px; }
-  .reset-btn:hover { background: #a93226; }
-  .empty { color: #888; font-style: italic; }
   label { display: grid; grid-template-columns: 90px 1fr 24px; align-items: center; gap: 6px; margin-bottom: 8px; }
   input[type="range"] { width: 100%; }
   .toggle { cursor: pointer; padding: 6px 10px; background: #555; color: #fff; border-radius: 4px; text-align: center; }
@@ -24,11 +19,6 @@
   <label>Mask expand: <input type="range" id="mask-expand-slider" min="0" max="32" value="8"> <span id="mask-expand-val">8</span></label>
   <div class="toggle" id="gray-toggle">Grayscale: Off</div>
 </div>
-<details class="section">
-  <summary><b>CSP overrides</b></summary>
-  <button class="reset-btn" id="reset">Reset all CSP overrides</button>
-  <div id="domains"></div>
-</details>
 <script src="popup.js"></script>
 </body>
 </html>
