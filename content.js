@@ -221,7 +221,7 @@
   let blurAmount = 0;
   let blurOff = true;
   let grayOn = false;
-  let maskBlur = 4;
+  let maskBlur = 2;
   let maskExpand = 8;
   let blurSpans = circleRowSpans(maskBlur);
   let expandSpans = circleRowSpans(maskExpand);
@@ -421,7 +421,16 @@
       payload = { url: fetchUrl };
     } else {
       payload = profile("seg.encode", () => {
-        const scale = Math.min(1, MAX_SEG_DIM / Math.max(bitmap.width, bitmap.height));
+        // Cap the SHORT side at MAX_SEG_DIM (not the long side) so wide/tall
+        // images keep detail on their short axis instead of being crushed
+        // (a 4.5:1 banner capped long-side would be 256x57). Also bound total
+        // pixels so an extreme aspect ratio can't blow up the base64 payload
+        // sent across the bridge.
+        const MAX_SEG_PIXELS = MAX_SEG_DIM * MAX_SEG_DIM * 4; // ~4x a square 256
+        let scale = Math.min(1, MAX_SEG_DIM / Math.min(bitmap.width, bitmap.height));
+        if (bitmap.width * bitmap.height * scale * scale > MAX_SEG_PIXELS) {
+          scale = Math.sqrt(MAX_SEG_PIXELS / (bitmap.width * bitmap.height));
+        }
         const sw = Math.max(1, Math.round(bitmap.width * scale));
         const sh = Math.max(1, Math.round(bitmap.height * scale));
         const canvas = document.createElement("canvas");

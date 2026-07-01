@@ -50,19 +50,16 @@ function bytesToBase64(bytes) {
   return btoa(binary);
 }
 
-  // Build a segmentation-ready bitmap (downscaled to <= MAX_SEG_DIM) from a URL.
+  // Build a segmentation-ready bitmap from a URL. Pass the FULL-res bitmap to
+  // the segmenter and let MediaPipe do its own single resize to the model's
+  // input tensor — this path is local to the offscreen doc, so there's no
+  // transfer cost and no reason to pre-downscale (which would resample twice).
   async function bitmapFromUrl(url) {
     const resp = await fetch(url);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const blob = await resp.blob();
     const full = await createImageBitmap(blob);
-    const scale = Math.min(1, MAX_SEG_DIM / Math.max(full.width, full.height));
-    const sw = Math.max(1, Math.round(full.width * scale));
-    const sh = Math.max(1, Math.round(full.height * scale));
-    if (scale === 1) return { bitmap: full, sw, sh };
-    const scaled = await createImageBitmap(full, { resizeWidth: sw, resizeHeight: sh, resizeQuality: "high" });
-    full.close();
-    return { bitmap: scaled, sw, sh };
+    return { bitmap: full, sw: full.width, sh: full.height };
   }
 
   // Build a bitmap from pre-downscaled RGBA pixels (blob:/data: fallback).
@@ -85,15 +82,31 @@ function bytesToBase64(bytes) {
       let raw = null;
       let mw = 0, mh = 0;
       if (mask) {
-        // The mask is returned at the model's own output resolution
-        // (e.g. 256x256), NOT the input bitmap's size — use the mask's real
-        // width/height so the caller upscales it correctly. Assuming input
-        // dims here misaligns the mask on non-square images.
-        mw = mask.width;
-        mh = mask.height;
+        // The mask comes back at MediaPipe's output resolution, which tracks
+        // the input bitmap size — since we now pass full-res input, that can be
+        // large. We don't need a high-res mask (the caller reshapes + upscales
+        // it anyway), so cap the returned mask at MAX_SEG_DIM on the SHORT side
+        // to keep the payload bounded while preserving detail on the short axis
+        // (capping the long side would crush a wide banner to e.g. 256x57).
+        // Binarize person vs. not.
+        const fw = mask.width, fh = mask.height;
         const maskData = mask.getAsUint8Array();
+        const mscale = Math.min(1, MAX_SEG_DIM / Math.min(fw, fh));
+        mw = Math.max(1, Math.round(fw * mscale));
+        mh = Math.max(1, Math.round(fh * mscale));
         raw = new Uint8Array(mw * mh);
-        for (let i = 0; i < maskData.length; i++) raw[i] = maskData[i] > 0 ? 255 : 0;
+        if (mw === fw && mh === fh) {
+          for (let i = 0; i < maskData.length; i++) raw[i] = maskData[i] > 0 ? 255 : 0;
+        } else {
+          // Nearest-neighbour downsample of the binary person mask.
+          for (let y = 0; y < mh; y++) {
+            const sy = Math.min(fh - 1, (y / mscale) | 0);
+            for (let x = 0; x < mw; x++) {
+              const sx = Math.min(fw - 1, (x / mscale) | 0);
+              raw[y * mw + x] = maskData[sy * fw + sx] > 0 ? 255 : 0;
+            }
+          }
+        }
         result.close();
       }
       sendResponse({ rawB64: raw ? bytesToBase64(raw) : null, w: mw, h: mh });

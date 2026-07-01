@@ -10,7 +10,7 @@ const grayToggle = document.getElementById("gray-toggle");
 
 let grayOn = false;
 
-const DEFAULTS = { blurAmount: 0, maskBlur: 4, maskExpand: 8, grayOn: false };
+const DEFAULTS = { blurAmount: 0, maskBlur: 2, maskExpand: 8, grayOn: false };
 
 function sendSettings(settings) {
   chrome.storage.local.set(settings);
