@@ -21,22 +21,14 @@
       "js": ["content.js"],
       "run_at": "document_start",
       "world": "MAIN",
-      "all_frames": true,
-      "exclude_matches": [
-        "https://*.midway-auth.amazon.com/*",
-        "https://w.amazon.com/*"
-      ]
+      "all_frames": true
     },
     {
       "matches": ["<all_urls>"],
       "js": ["bridge.js"],
       "run_at": "document_start",
       "world": "ISOLATED",
-      "all_frames": true,
-      "exclude_matches": [
-        "https://*.midway-auth.amazon.com/*",
-        "https://w.amazon.com/*"
-      ]
+      "all_frames": true
     }
   ]
 }
