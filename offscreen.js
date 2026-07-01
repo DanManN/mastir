@@ -76,20 +76,27 @@ function bytesToBase64(bytes) {
     if (msg.type !== "mastir-segment-offscreen") return false;
     (async () => {
       const seg = await loadSegmenter();
-      const { bitmap, sw, sh } = msg.url
+      const { bitmap } = msg.url
         ? await bitmapFromUrl(msg.url)
         : await bitmapFromPixels(msg.pixelsB64, msg.w, msg.h);
       const result = seg.segment(bitmap);
       bitmap.close();
       const mask = result.categoryMask;
       let raw = null;
+      let mw = 0, mh = 0;
       if (mask) {
+        // The mask is returned at the model's own output resolution
+        // (e.g. 256x256), NOT the input bitmap's size — use the mask's real
+        // width/height so the caller upscales it correctly. Assuming input
+        // dims here misaligns the mask on non-square images.
+        mw = mask.width;
+        mh = mask.height;
         const maskData = mask.getAsUint8Array();
-        raw = new Uint8Array(sw * sh);
+        raw = new Uint8Array(mw * mh);
         for (let i = 0; i < maskData.length; i++) raw[i] = maskData[i] > 0 ? 255 : 0;
         result.close();
       }
-      sendResponse({ rawB64: raw ? bytesToBase64(raw) : null, w: sw, h: sh });
+      sendResponse({ rawB64: raw ? bytesToBase64(raw) : null, w: mw, h: mh });
     })().catch((e) => {
       console.warn("[mastir/offscreen] segment failed:", e.message);
       sendResponse({ error: e.message });

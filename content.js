@@ -181,6 +181,43 @@
     };
   }
 
+  // Debug: overlay the computed mask (red, semi-transparent) on the ORIGINAL
+  // image pixels so alignment can be inspected directly. Call from the console:
+  //   mastirDebugMask(0)  — index into the currently segmented elements
+  //   mastirDebugMask(document.querySelectorAll('img')[3])  — or pass an element
+  // Opens a data URL in a new tab showing original + red mask.
+  window.mastirDebugMask = (target) => {
+    let img = target;
+    if (typeof target === "number") img = [...segAllElements][target];
+    if (!img) { console.warn("[mastir] no element; segAllElements size =", segAllElements.size); return; }
+    const cached = segMaskCache.get(img);
+    if (!cached || !cached.originalPixels) { console.warn("[mastir] no cached mask for element", img); return; }
+    const { originalPixels, maskAlpha, w, h } = cached;
+    const out = new Uint8ClampedArray(originalPixels);
+    for (let i = 0; i < maskAlpha.length; i++) {
+      const a = maskAlpha[i] / 255;
+      if (a > 0) {
+        const pi = i * 4;
+        out[pi] = out[pi] * (1 - a) + 255 * a;      // tint red where mask is set
+        out[pi + 1] = out[pi + 1] * (1 - a);
+        out[pi + 2] = out[pi + 2] * (1 - a);
+      }
+    }
+    const c = document.createElement("canvas");
+    c.width = w; c.height = h;
+    c.getContext("2d").putImageData(new ImageData(out, w, h), 0, 0);
+    console.log(`[mastir] mask ${cached.sw}x${cached.sh} -> image ${w}x${h}`, img);
+    // Chrome blocks top-level navigation to data: URLs, so pin the canvas over
+    // everything on the page instead. Click it to dismiss.
+    c.style.cssText = "position:fixed;top:20px;left:20px;z-index:2147483647;" +
+      "max-width:90vw;max-height:90vh;border:3px solid red;background:#000;cursor:pointer;box-shadow:0 0 30px #000";
+    c.title = "Mastir mask debug — click to close";
+    c.addEventListener("click", () => c.remove());
+    document.body.appendChild(c);
+    // Also emit a blob URL (not blocked like data:) in case you want it in a tab.
+    c.toBlob((b) => console.log("[mastir] mask preview blob:", URL.createObjectURL(b)));
+  };
+
   let blurAmount = 0;
   let blurOff = true;
   let grayOn = false;
@@ -341,8 +378,22 @@
   // Process the raw seg-res mask (dilate + blur) then upscale to display res.
   function buildMaskAlpha(entry) {
     if (!entry.raw) return new Uint8Array(entry.w * entry.h);
-    const small = profile("mask.dilateBlur", () => processRawMask(entry.raw, entry.sw, entry.sh));
-    return profile("mask.upscale", () => upscaleMask(small, entry.sw, entry.sh, entry.w, entry.h));
+    // Process in an intermediate box that matches the IMAGE's aspect ratio
+    // (bounded by MAX_SEG_DIM on the long side) rather than the raw seg mask,
+    // which may be square (the model's native output) or otherwise distorted.
+    // Order: (1) reshape raw mask to correct aspect, (2) dilate/blur uniformly
+    // there — cheap, ~256px — (3) upscale to full image with a uniform scale so
+    // the radius stays uniform. Dilating in the distorted seg space instead
+    // would apply the radius non-uniformly (an 8px expand on a squished mask
+    // becomes far larger on the short axis), making the mask look "zoomed in".
+    const scale = Math.min(1, MAX_SEG_DIM / Math.max(entry.w, entry.h));
+    const iw = Math.max(1, Math.round(entry.w * scale));
+    const ih = Math.max(1, Math.round(entry.h * scale));
+    const aspectFixed = (entry.sw === iw && entry.sh === ih)
+      ? entry.raw
+      : profile("mask.aspectFix", () => upscaleMask(entry.raw, entry.sw, entry.sh, iw, ih));
+    const processed = profile("mask.dilateBlur", () => processRawMask(aspectFixed, iw, ih));
+    return profile("mask.upscale", () => upscaleMask(processed, iw, ih, entry.w, entry.h));
   }
 
   function bytesToBase64(bytes) {
