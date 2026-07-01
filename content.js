@@ -596,6 +596,7 @@
       }
       return true;
     });
+    cached.hasPerson = didPaint;
     if (didPaint) {
       const dataUrl = profile("paint.toDataURL", () => {
         const canvas = document.createElement("canvas");
@@ -641,7 +642,11 @@
     } else {
       img.style.setProperty("filter", buildFilter(!blurOff), "important");
     }
-    if (didPaint && img.tagName === "IMG" && !img.__mastirOverlayPaint) observeSrc(img);
+    // Observe src changes on every segmented image, not just painted ones —
+    // a revealed (no-person) thumbnail can later have its src swapped to new
+    // content (e.g. YouTube's animated hover preview), which must be re-blurred
+    // and re-segmented rather than left revealed.
+    if (img.tagName === "IMG" && !img.__mastirOverlayPaint) observeSrc(img);
   }
 
 
@@ -670,8 +675,22 @@
     }
   }
 
+  // Animated images (GIF, animated WebP like YouTube's `an_webp` hover
+  // previews) are moving content we can only segment one frame of — a person
+  // could appear later. Treat them like video: keep permanently blurred, never
+  // segment or reveal.
+  const ANIMATED_IMG_RE = /\/an_webp\/|_\d+s\.webp|\.gif(\?|$)/i;
+  function isAnimatedImageUrl(url) {
+    return !!url && ANIMATED_IMG_RE.test(url);
+  }
+
   function enqueueImage(img) {
     if (segMaskCache.has(img) || segQueue.includes(img) || segProcessed.has(img)) return;
+    if (img.tagName === "IMG" && isAnimatedImageUrl(getImageUrl(img))) {
+      segProcessed.add(img);
+      blurElement(img);
+      return;
+    }
     segQueue.push(img);
     processQueue();
   }
@@ -787,10 +806,25 @@
       const img = m.target;
       if (img.__mastirOverlayPaint) continue; // already overlay-mode
       if (!segMaskCache.has(img)) continue;
-      const cached = segMaskCache.get(img);
-      if (!cached || !cached.originalPixels) continue;
       const current = img.src || "";
       if (current.startsWith("data:")) continue;
+
+      // Src swapped to an animated image (e.g. YouTube's hover preview over a
+      // revealed thumbnail) — moving content we can't fully segment. Blur it
+      // permanently and stop observing; don't reapply the stale mask.
+      if (isAnimatedImageUrl(current)) {
+        img.style.setProperty("filter", MAX_BLUR, "important");
+        srcObserver.unobserve(img);
+        continue;
+      }
+
+      const cached = segMaskCache.get(img);
+      if (!cached || !cached.originalPixels) continue;
+      // No person was found on this image — it was revealed, not masked. Don't
+      // reblur/reapply on src churn (that would fight Amazon's carousel and
+      // reblur product images). We only observe it to catch an animated swap
+      // (handled above); a static swap keeps it revealed.
+      if (!cached.hasPerson) continue;
       img.style.setProperty("filter", MAX_BLUR, "important");
       if (srcReapplyPending.has(img)) continue;
       const count = srcReapplyCount.get(img) || 0;
