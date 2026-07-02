@@ -658,21 +658,44 @@
 
   // Paint the masked result as a positioned overlay over the element — used
   // for images we can't repaint in place (direct-view IMG, shadow-DOM custom
-  // elements). CSSOM positioning, so it works under strict style-src too.
+  // elements, churning images). All styling via CSSOM (setProperty), which
+  // CSP style-src does not govern — so this works under strict CSP too.
+  //
+  // The overlay is a 100%x100% absolutely-positioned child of a wrapper that
+  // shrink-wraps the ELEMENT (not its parent). This matters: putting the
+  // overlay in el.parentElement and forcing that parent position:relative sizes
+  // the overlay to the parent's box, which can be far larger than the image
+  // (e.g. a grid cell wrapping a small icon) and blow the layout up. A tight
+  // wrapper makes 100% == the element's own box, and because it's ordinary flow
+  // layout it tracks the element through scroll/resize/reflow with no JS.
   function paintOverlay(el, dataUrl) {
     let overlay = el.__mastirOverlay;
     if (!overlay) {
+      const parent = el.parentElement;
+      if (!parent) return;
+      // Wrap el in a tight, position:relative container that shrink-wraps it.
+      const wrapper = document.createElement("span");
+      const cs = getComputedStyle(el);
+      const ws = wrapper.style;
+      ws.setProperty("position", "relative", "important");
+      // Match the element's display box so wrapping doesn't reflow the page:
+      // inline-level images -> inline-block (shrink-wrap); block -> block.
+      ws.setProperty("display", cs.display === "block" || cs.display === "flex" || cs.display === "grid" ? "block" : "inline-block", "important");
+      ws.setProperty("padding", "0", "important");
+      ws.setProperty("margin", "0", "important");
+      ws.setProperty("border", "0", "important");
+      ws.setProperty("max-width", "100%", "important");
+      parent.insertBefore(wrapper, el);
+      wrapper.appendChild(el);
+      el.__mastirOverlayWrapper = wrapper;
+
       overlay = document.createElement("div");
       Object.assign(overlay.style, {
         position: "absolute", top: "0", left: "0", width: "100%", height: "100%",
         pointerEvents: "none", backgroundSize: "cover", backgroundPosition: "center", zIndex: "1",
       });
       el.__mastirOverlay = overlay;
-      const parent = el.parentElement;
-      if (parent) {
-        if (getComputedStyle(parent).position === "static") parent.style.position = "relative";
-        parent.insertBefore(overlay, el.nextSibling);
-      }
+      wrapper.appendChild(overlay);
     }
     overlay.style.setProperty("background-image", `url(${dataUrl})`, "important");
   }
@@ -827,7 +850,14 @@
         if (el.offsetWidth < 48 || el.offsetHeight < 48) continue;
         const bg = getComputedStyle(el).backgroundImage;
         const match = bg && bg !== "none" ? bg.match(/url\(["']?([^"')]+)["']?\)/) : null;
-        const url = match ? match[1] : attrImageUrl(el);
+        let url = match ? match[1] : null;
+        // Only fall back to an attribute-stored URL (data-png, landscape-src,
+        // etc.) when the element ISN'T just a container around a real <img>.
+        // Grid cells like flaticon's <li data-png="…512/….png"> hold the icon
+        // URL in an attribute but render it via a child <img> that we already
+        // segment — treating the <li> as an image too paints a cover-sized
+        // overlay over the whole cell and blows the layout up.
+        if (!url && !el.querySelector("img, [image-src]")) url = attrImageUrl(el);
         if (!url) continue;
         if (/\.(svg|gif)(\?|$)/i.test(url)) continue;
         // Custom elements that render their image in shadow DOM can't be
