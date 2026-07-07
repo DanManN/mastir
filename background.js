@@ -20,7 +20,7 @@ async function ensureOffscreen() {
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === "fetch") {
-    fetch(msg.url)
+    fetch(msg.url, { credentials: "include" })
       .then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.blob();
@@ -31,7 +31,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         reader.onerror = () => sendResponse({ error: "FileReader failed" });
         reader.readAsDataURL(blob);
       })
-      .catch((e) => sendResponse({ error: e.message }));
+      .catch((e) => {
+        console.warn("[mastir/bg] fetch failed:", msg.url.slice(0, 100), e.message);
+        sendResponse({ error: e.message });
+      });
     return true;
   }
 

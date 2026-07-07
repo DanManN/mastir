@@ -3,8 +3,17 @@
   "name": "Mastir",
   "version": "1.0",
   "description": "Conceals people in images using person segmentation",
-  "permissions": ["offscreen", "storage"],
+  "permissions": ["offscreen", "storage", "declarativeNetRequest"],
   "host_permissions": ["<all_urls>"],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "mastir_cors",
+        "enabled": true,
+        "path": "dnr_rules.json"
+      }
+    ]
+  },
   "action": {
     "default_popup": "popup.html",
     "default_title": "Mastir Settings"

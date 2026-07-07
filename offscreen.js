@@ -7,6 +7,28 @@
 // person-mask at the downscaled resolution.
 
 const MAX_SEG_DIM = 256;
+
+// --- Model configuration ---------------------------------------------------
+// Swap the active model by changing ACTIVE_MODEL. Each entry describes its
+// asset and how to interpret the category mask into "person" pixels:
+//   isPerson(category) -> true if that class index counts as a person.
+//
+// selfie_multiclass_256x256: 6 classes, everything non-background (>0) is the
+//   subject (hair/body-skin/face-skin/clothes/accessories). Selfie framing.
+// deeplabv3 (Pascal VOC): 21 classes, person == class 15. General semantic
+//   segmentation — whole clothed body, arbitrary framing, multiple people.
+const MODELS = {
+  selfie: {
+    asset: "selfie_multiclass_256x256.tflite",
+    isPerson: (c) => c > 0,
+  },
+  deeplab: {
+    asset: "deeplabv3.tflite",
+    isPerson: (c) => c === 15,
+  },
+};
+const ACTIVE_MODEL = "selfie";
+
 let segmenter = null;
 let segLoading = null;
 
@@ -14,18 +36,19 @@ function loadSegmenter() {
   if (segmenter) return Promise.resolve(segmenter);
   if (segLoading) return segLoading;
   segLoading = (async () => {
+    const model = MODELS[ACTIVE_MODEL];
     const vision = await import(chrome.runtime.getURL("vision_bundle.mjs"));
     const wasmFiles = await vision.FilesetResolver.forVisionTasks(chrome.runtime.getURL("wasm"));
     segmenter = await vision.ImageSegmenter.createFromOptions(wasmFiles, {
       baseOptions: {
-        modelAssetPath: chrome.runtime.getURL("selfie_multiclass_256x256.tflite"),
+        modelAssetPath: chrome.runtime.getURL(model.asset),
         delegate: "GPU",
       },
       runningMode: "IMAGE",
       outputCategoryMask: true,
       outputConfidenceMasks: false,
     });
-    console.log("[mastir/offscreen] segmenter ready");
+    console.log(`[mastir/offscreen] segmenter ready (${ACTIVE_MODEL})`);
     return segmenter;
   })().catch((e) => {
     segLoading = null;
@@ -73,6 +96,7 @@ function bytesToBase64(bytes) {
     if (msg.type !== "mastir-segment-offscreen") return false;
     (async () => {
       const seg = await loadSegmenter();
+      const isPerson = MODELS[ACTIVE_MODEL].isPerson;
       const { bitmap } = msg.url
         ? await bitmapFromUrl(msg.url)
         : await bitmapFromPixels(msg.pixelsB64, msg.w, msg.h);
@@ -96,14 +120,14 @@ function bytesToBase64(bytes) {
         mh = Math.max(1, Math.round(fh * mscale));
         raw = new Uint8Array(mw * mh);
         if (mw === fw && mh === fh) {
-          for (let i = 0; i < maskData.length; i++) raw[i] = maskData[i] > 0 ? 255 : 0;
+          for (let i = 0; i < maskData.length; i++) raw[i] = isPerson(maskData[i]) ? 255 : 0;
         } else {
           // Nearest-neighbour downsample of the binary person mask.
           for (let y = 0; y < mh; y++) {
             const sy = Math.min(fh - 1, (y / mscale) | 0);
             for (let x = 0; x < mw; x++) {
               const sx = Math.min(fw - 1, (x / mscale) | 0);
-              raw[y * mw + x] = maskData[sy * fw + sx] > 0 ? 255 : 0;
+              raw[y * mw + x] = isPerson(maskData[sy * fw + sx]) ? 255 : 0;
             }
           }
         }

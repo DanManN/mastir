@@ -317,6 +317,43 @@
     });
   }
 
+  function decodeToBitmap(src) {
+    return new Promise((resolve, reject) => {
+      const im = new Image();
+      im.onload = () => resolve(createImageBitmap(im));
+      im.onerror = () => reject(new Error("decode failed"));
+      im.src = src;
+    });
+  }
+
+  // Acquire a decoded bitmap for an image URL, trying two fetch contexts and
+  // stopping at the first that yields readable (untainted) bytes:
+  //   1. crossOrigin="anonymous" <img> — readable when the response carries
+  //      CORS headers. Our declarativeNetRequest rule injects
+  //      Access-Control-Allow-Origin on image responses, so this now works for
+  //      most cross-origin images without an extra request.
+  //   2. Background fetch (crossFetch) — extension origin + host permissions,
+  //      bypasses the PAGE's CORS for images rung 1 still can't read.
+  async function acquireBitmap(fetchUrl) {
+    if (fetchUrl.startsWith("blob:")) {
+      // blob: only loads in-page; no fetch fallback possible.
+      return decodeToBitmap(fetchUrl);
+    }
+    // 1. crossOrigin image load (unblocked by the DNR ACAO rule).
+    try {
+      const im = new Image();
+      im.crossOrigin = "anonymous";
+      return await new Promise((resolve, reject) => {
+        im.onload = () => resolve(createImageBitmap(im));
+        im.onerror = () => reject(new Error("crossOrigin load failed"));
+        im.src = fetchUrl;
+      });
+    } catch (e) { /* fall through */ }
+    // 2. Background fetch (extension context, host-permission CORS bypass).
+    const dataUrl = await crossFetch(fetchUrl);
+    return decodeToBitmap(dataUrl);
+  }
+
   // Segmentation runs in an offscreen extension page (GPU, own CSP).
   const MAX_SEG_DIM = 256;
 
@@ -470,34 +507,50 @@
   // Segment in the offscreen doc. For normal http(s) URLs, send just the URL
   // and let the offscreen page fetch + downscale full-res (sharper input). For
   // blob:/data: URLs it can't fetch, downscale here and send the pixels.
+  // Encode the already-decoded bitmap to a downscaled base64 payload for the
+  // offscreen doc. Used as the fallback when the URL fast-path fails.
+  function encodePixels(bitmap) {
+    return profile("seg.encode", () => {
+      // Cap the SHORT side at MAX_SEG_DIM (not the long side) so wide/tall
+      // images keep detail on their short axis instead of being crushed
+      // (a 4.5:1 banner capped long-side would be 256x57). Also bound total
+      // pixels so an extreme aspect ratio can't blow up the base64 payload
+      // sent across the bridge.
+      const MAX_SEG_PIXELS = MAX_SEG_DIM * MAX_SEG_DIM * 4; // ~4x a square 256
+      let scale = Math.min(1, MAX_SEG_DIM / Math.min(bitmap.width, bitmap.height));
+      if (bitmap.width * bitmap.height * scale * scale > MAX_SEG_PIXELS) {
+        scale = Math.sqrt(MAX_SEG_PIXELS / (bitmap.width * bitmap.height));
+      }
+      const sw = Math.max(1, Math.round(bitmap.width * scale));
+      const sh = Math.max(1, Math.round(bitmap.height * scale));
+      const canvas = document.createElement("canvas");
+      canvas.width = sw;
+      canvas.height = sh;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(bitmap, 0, 0, sw, sh);
+      const pixels = ctx.getImageData(0, 0, sw, sh).data;
+      return { pixelsB64: bytesToBase64(new Uint8Array(pixels.buffer)), w: sw, h: sh };
+    });
+  }
+
   async function segment(fetchUrl, bitmap) {
-    let payload;
+    // Fast path: for http(s) URLs, let the offscreen doc fetch full-res itself
+    // (sharper mask, no bridge transfer). If that fails — e.g. the offscreen's
+    // fetch hits CORS on an image whose bytes we ALREADY have in `bitmap` (wiki
+    // images that 302 to origin-locked S3, which our background fetch got past)
+    // — fall back to shipping the decoded pixels across the bridge.
     if (/^https?:/.test(fetchUrl)) {
-      payload = { url: fetchUrl };
-    } else {
-      payload = profile("seg.encode", () => {
-        // Cap the SHORT side at MAX_SEG_DIM (not the long side) so wide/tall
-        // images keep detail on their short axis instead of being crushed
-        // (a 4.5:1 banner capped long-side would be 256x57). Also bound total
-        // pixels so an extreme aspect ratio can't blow up the base64 payload
-        // sent across the bridge.
-        const MAX_SEG_PIXELS = MAX_SEG_DIM * MAX_SEG_DIM * 4; // ~4x a square 256
-        let scale = Math.min(1, MAX_SEG_DIM / Math.min(bitmap.width, bitmap.height));
-        if (bitmap.width * bitmap.height * scale * scale > MAX_SEG_PIXELS) {
-          scale = Math.sqrt(MAX_SEG_PIXELS / (bitmap.width * bitmap.height));
-        }
-        const sw = Math.max(1, Math.round(bitmap.width * scale));
-        const sh = Math.max(1, Math.round(bitmap.height * scale));
-        const canvas = document.createElement("canvas");
-        canvas.width = sw;
-        canvas.height = sh;
-        const ctx = canvas.getContext("2d");
-        ctx.drawImage(bitmap, 0, 0, sw, sh);
-        const pixels = ctx.getImageData(0, 0, sw, sh).data;
-        return { pixelsB64: bytesToBase64(new Uint8Array(pixels.buffer)), w: sw, h: sh };
-      });
+      try {
+        const resp = await profileAsync("seg.roundtrip", () => bridgeRequest("mastir-segment", { url: fetchUrl }, 20000));
+        const raw = profile("seg.decode", () => resp.rawB64 ? base64ToBytes(resp.rawB64) : null);
+        return { raw, sw: resp.w, sh: resp.h };
+      } catch (e) {
+        // Offscreen URL fetch failed (e.g. CORS on an S3-redirected wiki image
+        // whose bytes we already have). Fall through to the pixel path.
+        console.debug("[mastir] URL segment failed, retrying with pixels:", e.message);
+      }
     }
-    const resp = await profileAsync("seg.roundtrip", () => bridgeRequest("mastir-segment", payload, 20000));
+    const resp = await profileAsync("seg.roundtrip", () => bridgeRequest("mastir-segment", encodePixels(bitmap), 20000));
     if (resp.error) throw new Error(resp.error);
     const raw = profile("seg.decode", () => resp.rawB64 ? base64ToBytes(resp.rawB64) : null);
     return { raw, sw: resp.w, sh: resp.h };
@@ -537,12 +590,22 @@
     return attrImageUrl(el);
   }
 
-  // Mark an image resolved without a mask (SVG/GIF, too small, or unfetchable).
-  function markDone(img) {
+  // Mark an image resolved without a mask. keepBlur=true leaves it fully
+  // blurred (fail-safe for images we couldn't inspect — 404/CORS/decode — so we
+  // never reveal something unexamined). keepBlur=false reveals per the global
+  // preference (SVG/GIF/tiny images that are safe to show).
+  function markDone(img, keepBlur = false) {
     segProcessed.add(img);
     segMaskCache.set(img, { originalPixels: null, maskAlpha: new Uint8Array(0), raw: null, sw: 0, sh: 0, w: 0, h: 0 });
     segAllElements.add(img);
-    img.style.setProperty("filter", buildFilter(!blurOff), "important");
+    if (keepBlur) {
+      // Latch permanent blur — applyBlur (runs on every mutation) must not
+      // reset this to the revealed state, since we couldn't inspect the image.
+      img.__mastirForceBlur = true;
+      img.style.setProperty("filter", MAX_BLUR, "important");
+    } else {
+      img.style.setProperty("filter", buildFilter(!blurOff), "important");
+    }
   }
 
   async function processImage(img) {
@@ -586,21 +649,7 @@
         return;
       }
 
-      const bitmap = await new Promise((resolve, reject) => {
-        const tmp = new Image();
-        if (!fetchUrl.startsWith("blob:")) tmp.crossOrigin = "anonymous";
-        tmp.onload = () => resolve(createImageBitmap(tmp));
-        tmp.onerror = () => {
-          if (fetchUrl.startsWith("blob:")) { reject(new Error("blob load failed")); return; }
-          crossFetch(fetchUrl).then((dataUrl) => {
-            const tmp2 = new Image();
-            tmp2.onload = () => resolve(createImageBitmap(tmp2));
-            tmp2.onerror = () => reject(new Error("decode failed"));
-            tmp2.src = dataUrl;
-          }).catch(reject);
-        };
-        tmp.src = fetchUrl;
-      });
+      const bitmap = await acquireBitmap(fetchUrl);
 
       const { raw, sw, sh } = await segment(fetchUrl, bitmap);
       const w = bitmap.width, h = bitmap.height;
@@ -618,7 +667,13 @@
       applyMask(img);
     } catch (e) {
       console.warn("[mastir] processImage failed:", e.message, src?.substring(0, 80));
-      if (/SVG|natural dimensions|createImageBitmap|Assertion|CORS|blocked|decode failed|blob load failed/i.test(e.message)) {
+      // Unreadable-by-script: give up immediately and KEEP the pre-blur — never
+      // reveal an image we couldn't inspect. HTTP 4xx (404/403/410) are dead or
+      // forbidden URLs; CORS/decode failures won't change on retry either.
+      if (/CORS|blocked|decode failed|blob load failed|HTTP 4\d\d/i.test(e.message)) {
+        markDone(img, true);
+      } else if (/SVG|natural dimensions|createImageBitmap|Assertion/i.test(e.message)) {
+        // Benign non-images (SVG/GIF/undecodable vector) — safe to reveal.
         markDone(img);
       } else {
         segProcessed.delete(img);
@@ -897,6 +952,9 @@
       // A played video is latched to MAX_BLUR — don't reset it here (applyBlur
       // runs on every DOM mutation, which would fight the playback blur).
       if (el.tagName === "VIDEO" && el.__mastirPlayed) return;
+      // Unreadable images (404/CORS) are force-blurred and must never be
+      // revealed by a mutation-driven applyBlur pass.
+      if (el.__mastirForceBlur) return;
       el.style.setProperty("filter", buildFilter(!blurOff), "important");
     });
   }
