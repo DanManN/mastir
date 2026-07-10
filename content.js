@@ -326,15 +326,40 @@
     });
   }
 
-  // Acquire a decoded bitmap for an image URL, trying two fetch contexts and
-  // stopping at the first that yields readable (untainted) bytes:
-  //   1. crossOrigin="anonymous" <img> — readable when the response carries
-  //      CORS headers. Our declarativeNetRequest rule injects
-  //      Access-Control-Allow-Origin on image responses, so this now works for
-  //      most cross-origin images without an extra request.
+  // Read pixels from an already-decoded <img> element by drawing it to a
+  // canvas. Uses the element's IN-MEMORY decoded bitmap, not its src — so it
+  // works even after the src (e.g. a blob:) has been revoked. Throws if the
+  // element isn't decoded yet or if the canvas is tainted (cross-origin without
+  // CORS), in which case the caller falls back to fetching.
+  async function bitmapFromElement(el) {
+    if (!el || el.tagName !== "IMG" || !el.naturalWidth || !el.naturalHeight) {
+      throw new Error("element not decoded");
+    }
+    const canvas = document.createElement("canvas");
+    canvas.width = el.naturalWidth;
+    canvas.height = el.naturalHeight;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(el, 0, 0);
+    // Touch the pixels to force the taint check to throw here (not later).
+    ctx.getImageData(0, 0, 1, 1);
+    return createImageBitmap(canvas);
+  }
+
+  // Acquire a decoded bitmap for an image, trying progressively:
+  //   0. The live <img> element's own decoded pixels (drawImage). No network;
+  //      works for same-origin images even after their blob:/src is revoked
+  //      (e.g. Tableau tiles). Throws on taint (cross-origin) -> fall through.
+  //   1. crossOrigin="anonymous" <img> load — readable when the response
+  //      carries CORS headers. Our declarativeNetRequest rule injects
+  //      Access-Control-Allow-Origin on image responses, so this works for most
+  //      cross-origin images without an extra request.
   //   2. Background fetch (crossFetch) — extension origin + host permissions,
   //      bypasses the PAGE's CORS for images rung 1 still can't read.
-  async function acquireBitmap(fetchUrl) {
+  async function acquireBitmap(fetchUrl, el) {
+    // 0. Live element pixels (no fetch; survives revoked blob: src).
+    try {
+      return await bitmapFromElement(el);
+    } catch (e) { /* not decoded / tainted — fall through */ }
     if (fetchUrl.startsWith("blob:")) {
       // blob: only loads in-page; no fetch fallback possible.
       return decodeToBitmap(fetchUrl);
@@ -629,7 +654,10 @@
 
     segProcessed.add(img);
 
-    if (/\.(svg|gif)(\?|$)/i.test(src) || /^data:image\/(svg|gif)/i.test(src)) {
+    // SVGs are vector (no photographic people) and safe to reveal without
+    // segmenting. GIFs are raster and CAN contain people, so they go through
+    // normal segmentation (first frame) rather than being blanket-revealed.
+    if (/\.svg(\?|$)/i.test(src) || /^data:image\/svg/i.test(src)) {
       markDone(img);
       return;
     }
@@ -649,7 +677,7 @@
         return;
       }
 
-      const bitmap = await acquireBitmap(fetchUrl);
+      const bitmap = await acquireBitmap(fetchUrl, img);
 
       const { raw, sw, sh } = await segment(fetchUrl, bitmap);
       const w = bitmap.width, h = bitmap.height;
@@ -821,7 +849,13 @@
           img.style.setProperty("background-image", `url(${dataUrl})`, "important");
         }
       }
-    } else if (img.tagName === "IMG" && segOriginalSrc.has(img)) {
+    } else if (img.tagName === "IMG" && img.src !== segOriginalSrc.get(img) &&
+               segOriginalSrc.has(img) && !segOriginalSrc.get(img).startsWith("blob:")) {
+      // No person found: restore the original src ONLY if we actually changed
+      // it and the original is still valid. Never rewrite to a blob: URL — the
+      // page may have revoked it (e.g. Tableau tiles), which would blank the
+      // image. In the normal no-person flow src was never touched, so this is
+      // usually a no-op.
       selfUpdating = true;
       img.src = segOriginalSrc.get(img);
       selfUpdating = false;
@@ -868,11 +902,14 @@
     }
   }
 
-  // Animated images (GIF, animated WebP like YouTube's `an_webp` hover
-  // previews) are moving content we can only segment one frame of — a person
-  // could appear later. Treat them like video: keep permanently blurred, never
-  // segment or reveal.
-  const ANIMATED_IMG_RE = /\/an_webp\/|_\d+s\.webp|\.gif(\?|$)/i;
+  // Known-animated image URLs (YouTube's `an_webp` hover previews and
+  // `_<N>s.webp` animated thumbnails) are moving content we can only segment
+  // one frame of — a person could appear later — so treat them like video:
+  // keep permanently blurred, never segment or reveal.
+  // NOTE: .gif is intentionally NOT matched here — most GIFs are static (e.g.
+  // product/book covers) and blurring them all is wrong. A GIF goes through
+  // normal segmentation on its first frame like any other image.
+  const ANIMATED_IMG_RE = /\/an_webp\/|_\d+s\.webp/i;
   function isAnimatedImageUrl(url) {
     return !!url && ANIMATED_IMG_RE.test(url);
   }
