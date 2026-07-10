@@ -284,6 +284,7 @@
   // --- Person Segmentation ---
   const segProcessed = new WeakSet();
   const segOriginalSrc = new WeakMap();
+  const segFetchUrl = new WeakMap();
   const segMaskCache = new WeakMap();
   const segAllElements = new Set();
   const segUrlCache = new Map();
@@ -332,9 +333,17 @@
   // element isn't decoded yet or if the canvas is tainted (cross-origin without
   // CORS), in which case the caller falls back to fetching.
   async function bitmapFromElement(el) {
-    if (!el || el.tagName !== "IMG" || !el.naturalWidth || !el.naturalHeight) {
+    // Require a fully-loaded, decoded element. naturalWidth>0 alone is NOT
+    // enough — it goes non-zero at header decode, before the image is actually
+    // drawable, and drawing too early yields a BLACK canvas (which then paints
+    // the concealed person as a solid black blob). `complete` + decode() ensure
+    // the pixels are really there.
+    if (!el || el.tagName !== "IMG" || !el.naturalWidth || !el.naturalHeight || !el.complete) {
       throw new Error("element not decoded");
     }
+    // decode() resolves only once the image is fully decoded and drawable, so
+    // drawing after it can't produce the premature black frame.
+    try { await el.decode(); } catch (e) { throw new Error("element not decoded"); }
     const canvas = document.createElement("canvas");
     canvas.width = el.naturalWidth;
     canvas.height = el.naturalHeight;
@@ -345,24 +354,25 @@
     return createImageBitmap(canvas);
   }
 
-  // Acquire a decoded bitmap for an image, trying progressively:
-  //   0. The live <img> element's own decoded pixels (drawImage). No network;
-  //      works for same-origin images even after their blob:/src is revoked
-  //      (e.g. Tableau tiles). Throws on taint (cross-origin) -> fall through.
+  // Acquire a decoded bitmap for an image. Fetch the URL first (reliable,
+  // full-res source), and only fall back to reading the live element's pixels
+  // if fetching is impossible/failed:
   //   1. crossOrigin="anonymous" <img> load — readable when the response
   //      carries CORS headers. Our declarativeNetRequest rule injects
   //      Access-Control-Allow-Origin on image responses, so this works for most
   //      cross-origin images without an extra request.
   //   2. Background fetch (crossFetch) — extension origin + host permissions,
   //      bypasses the PAGE's CORS for images rung 1 still can't read.
+  //   3. Live <img> element pixels (drawImage) — LAST resort, for images whose
+  //      URL can't be fetched at all (e.g. revoked blob: srcs like Tableau
+  //      tiles). Draws the element's in-memory decode. Guarded against a
+  //      failed/black draw so it fails safe (stays blurred) rather than
+  //      concealing to a black blob.
   async function acquireBitmap(fetchUrl, el) {
-    // 0. Live element pixels (no fetch; survives revoked blob: src).
-    try {
-      return await bitmapFromElement(el);
-    } catch (e) { /* not decoded / tainted — fall through */ }
+    // blob: can't be fetched cross-context — try in-page decode, then element.
     if (fetchUrl.startsWith("blob:")) {
-      // blob: only loads in-page; no fetch fallback possible.
-      return decodeToBitmap(fetchUrl);
+      try { return await decodeToBitmap(fetchUrl); }
+      catch (e) { return await bitmapFromElement(el); }
     }
     // 1. crossOrigin image load (unblocked by the DNR ACAO rule).
     try {
@@ -375,8 +385,12 @@
       });
     } catch (e) { /* fall through */ }
     // 2. Background fetch (extension context, host-permission CORS bypass).
-    const dataUrl = await crossFetch(fetchUrl);
-    return decodeToBitmap(dataUrl);
+    try {
+      const dataUrl = await crossFetch(fetchUrl);
+      return await decodeToBitmap(dataUrl);
+    } catch (e) { /* fall through */ }
+    // 3. Last resort: the live element's own decoded pixels.
+    return bitmapFromElement(el);
   }
 
   // Segmentation runs in an offscreen extension page (GPU, own CSP).
@@ -598,21 +612,39 @@
     if (el.tagName === "VIDEO") {
       return el.getAttribute("poster") || null;
     }
-    const srcset = el.getAttribute("srcset");
-    if (srcset) {
-      const first = srcset.trim().split(/,\s*(?=https?:\/\/)/)[0];
-      return first.trim().split(/\s+/)[0];
-    }
+    // Prefer a real http(s)/blob source over a tiny data:-URI placeholder that
+    // some sites (e.g. Google Images) show in currentSrc while the real image
+    // lazy-loads. currentSrc reflects what's *displayed* (often the placeholder),
+    // but el.src / the src attribute frequently already holds the real URL.
+    const isReal = (u) => !!u && !u.startsWith("data:") && !u.includes(" ");
+    if (isReal(el.currentSrc)) return el.currentSrc;
     const imageSrc = el.getAttribute("image-src");
     if (imageSrc) return imageSrc;
-    const src = el.currentSrc || el.src;
-    if (src && !src.includes(" ")) return src;
+    const srcset = el.getAttribute("srcset");
+    if (srcset) {
+      // Pick the largest candidate (highest descriptor), skipping data: URIs.
+      const best = srcset.split(",")
+        .map((c) => c.trim())
+        .map((c) => { const [url, d] = c.split(/\s+/); return { url, w: parseFloat(d) || 0 }; })
+        .filter((c) => c.url && !c.url.startsWith("data:"))
+        .sort((a, b) => b.w - a.w)[0];
+      if (best) return best.url;
+    }
+    // The src attribute may hold the real URL even when currentSrc is a
+    // placeholder — check el.src and the raw attribute, not currentSrc.
+    if (isReal(el.src)) return el.src;
+    const srcAttr = el.getAttribute("src");
+    if (isReal(srcAttr)) return srcAttr;
     const bg = getComputedStyle(el).backgroundImage;
     if (bg && bg !== "none") {
       const match = bg.match(/url\(["']?([^"')]+)["']?\)/);
       if (match) return match[1];
     }
-    return attrImageUrl(el);
+    const attrUrl = attrImageUrl(el);
+    if (attrUrl) return attrUrl;
+    // Last resort: a data:-URI placeholder is still a real, viewable image —
+    // segment its pixels rather than skipping the element entirely.
+    return el.currentSrc || el.src || null;
   }
 
   // Mark an image resolved without a mask. keepBlur=true leaves it fully
@@ -666,6 +698,9 @@
     try {
       const fetchUrl = getImageUrl(img);
       if (!fetchUrl) return;
+      // Record the exact URL we segment, so urlSwapObserver can tell a genuine
+      // content swap (re-segment) from benign churn of the same URL.
+      segFetchUrl.set(img, fetchUrl);
 
       if (segUrlCache.has(fetchUrl)) {
         const cached = segUrlCache.get(fetchUrl);
@@ -966,6 +1001,12 @@
     if (el.tagName === "IMG" || el.hasAttribute("image-src") || !SKIP_BG_TAGS.has(el.tagName)) {
       visibilityObserver.observe(el);
     }
+    // Watch <img> src swaps (placeholder -> real URL) so lazy-loaded images get
+    // re-segmented once their real source lands, regardless of processing order.
+    if (el.tagName === "IMG" && !el.__mastirUrlSwapWatched) {
+      el.__mastirUrlSwapWatched = true;
+      observeUrlSwap(el);
+    }
   }
 
   function runSegmentation() {
@@ -1093,6 +1134,41 @@
   function observeSrc(img) {
     srcReapplyCount.set(img, 0);
     srcObserver.observe(img, { attributes: true, attributeFilter: ["src", "srcset"] });
+  }
+
+  // Watches EVERY discovered image for its src becoming a real (http/blob) URL.
+  // Lazy-loading sites (Google Images, infinite-scroll grids, SPAs) often mount
+  // an <img> with only a tiny data:-URI placeholder, then swap in the real URL
+  // asynchronously. If we happened to process the element while it still had the
+  // placeholder, we segmented the wrong (tiny) image or bailed — this re-runs
+  // segmentation once the real URL lands, closing that timing race.
+  const lastSwapUrl = new WeakMap();
+  const urlSwapObserver = new MutationObserver((mutations) => {
+    if (selfUpdating) return;
+    for (const m of mutations) {
+      if (m.type !== "attributes") continue;
+      const img = m.target;
+      if (img.__mastirOverlayPaint) continue;              // overlay mode: srcObserver owns it
+      const url = getImageUrl(img);
+      if (!url || url.startsWith("data:")) continue;        // still a placeholder
+      if (lastSwapUrl.get(img) === url) continue;           // no real change
+      lastSwapUrl.set(img, url);
+      // If we already segmented this element, only re-run when the new real URL
+      // differs from the URL we actually segmented (segOriginalSrc). This catches
+      // the startup race where we segmented a data:/placeholder or a low-res
+      // variant and Google later swapped in the real image. When the URL matches
+      // what we segmented, it's benign churn — leave it to srcObserver so we
+      // don't fight Amazon carousels / re-mask needlessly.
+      if (segMaskCache.has(img) && segFetchUrl.get(img) === url) continue;
+      segProcessed.delete(img);
+      segMaskCache.delete(img);
+      enqueueImage(img);
+    }
+  });
+
+  function observeUrlSwap(img) {
+    lastSwapUrl.set(img, getImageUrl(img) || "");
+    urlSwapObserver.observe(img, { attributes: true, attributeFilter: ["src", "srcset"] });
   }
 
   // Skip tiny iframes (tracking pixels, ad beacons) — no meaningful images.
