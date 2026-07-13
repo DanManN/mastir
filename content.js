@@ -149,9 +149,11 @@
   }
 
   new MutationObserver((mutations) => {
-    for (const m of mutations) {
-      for (const node of m.addedNodes) processNode(node);
-    }
+    profile("obs.docChildList", () => {
+      for (const m of mutations) {
+        for (const node of m.addedNodes) processNode(node);
+      }
+    });
   }).observe(document.documentElement, { childList: true, subtree: true });
 
   const MAX_BLUR = "blur(20px) grayscale(100%)";
@@ -967,6 +969,7 @@
   const SKIP_BG_TAGS = new Set(["SCRIPT", "STYLE", "LINK", "META", "BR", "HR", "INPUT", "TEXTAREA", "SELECT", "BUTTON", "SVG", "PATH", "IMG"]);
 
   const visibilityObserver = new IntersectionObserver((entries) => {
+    profile("obs.intersection", () => {
     for (const entry of entries) {
       if (!entry.isIntersecting) continue;
       const el = entry.target;
@@ -997,6 +1000,7 @@
         enqueueImage(el);
       }
     }
+    });
   });
 
   function observeElement(el) {
@@ -1087,53 +1091,50 @@
 
   const srcObserver = new MutationObserver((mutations) => {
     if (selfUpdating) return;
-    for (const m of mutations) {
-      if (m.type !== "attributes") continue;
-      const img = m.target;
-      if (img.__mastirOverlayPaint) continue; // already overlay-mode
-      if (!segMaskCache.has(img)) continue;
-      const current = img.src || "";
-      if (current.startsWith("data:")) continue;
+    profile("obs.srcReapply", () => {
+      for (const m of mutations) {
+        if (m.type !== "attributes") continue;
+        const img = m.target;
+        if (img.__mastirOverlayPaint) continue; // already overlay-mode
+        if (!segMaskCache.has(img)) continue;
+        const current = img.src || "";
+        if (current.startsWith("data:")) continue;
 
-      // Src swapped to an animated image (e.g. YouTube's hover preview over a
-      // revealed thumbnail) — moving content we can't fully segment. Blur it
-      // permanently and stop observing; don't reapply the stale mask.
-      if (isAnimatedImageUrl(current)) {
-        img.style.setProperty("filter", MAX_BLUR, "important");
-        srcObserver.unobserve(img);
-        continue;
-      }
-
-      const cached = segMaskCache.get(img);
-      if (!cached || !cached.originalPixels) continue;
-      // No person was found on this image — it was revealed, not masked. Don't
-      // reblur/reapply on src churn (that would fight Amazon's carousel and
-      // reblur product images). We only observe it to catch an animated swap
-      // (handled above); a static swap keeps it revealed.
-      if (!cached.hasPerson) continue;
-      img.style.setProperty("filter", MAX_BLUR, "important");
-      if (srcReapplyPending.has(img)) continue;
-      const count = srcReapplyCount.get(img) || 0;
-      srcReapplyPending.add(img);
-      srcReapplyCount.set(img, count + 1);
-      requestAnimationFrame(() => {
-        srcReapplyPending.delete(img);
-        if (!segMaskCache.has(img)) return;
-        if (count >= MAX_INPLACE_REAPPLIES) {
-          // Churning image: switch to overlay mode permanently.
-          img.__mastirOverlayPaint = true;
+        // Src swapped to an animated image (e.g. YouTube's hover preview over a
+        // revealed thumbnail) — moving content we can't fully segment. Blur it
+        // permanently and stop observing; don't reapply the stale mask.
+        if (isAnimatedImageUrl(current)) {
+          img.style.setProperty("filter", MAX_BLUR, "important");
           srcObserver.unobserve(img);
-          img.style.setProperty("filter", buildFilter(!blurOff), "important");
-          selfUpdating = true;
-          applyMask(img);
-          selfUpdating = false;
-        } else if (!(img.src || "").startsWith("data:")) {
-          selfUpdating = true;
-          applyMask(img);
-          selfUpdating = false;
+          continue;
         }
-      });
-    }
+
+        const cached = segMaskCache.get(img);
+        if (!cached || !cached.originalPixels) continue;
+        if (!cached.hasPerson) continue;
+        img.style.setProperty("filter", MAX_BLUR, "important");
+        if (srcReapplyPending.has(img)) continue;
+        const count = srcReapplyCount.get(img) || 0;
+        srcReapplyPending.add(img);
+        srcReapplyCount.set(img, count + 1);
+        requestAnimationFrame(() => {
+          srcReapplyPending.delete(img);
+          if (!segMaskCache.has(img)) return;
+          if (count >= MAX_INPLACE_REAPPLIES) {
+            img.__mastirOverlayPaint = true;
+            srcObserver.unobserve(img);
+            img.style.setProperty("filter", buildFilter(!blurOff), "important");
+            selfUpdating = true;
+            applyMask(img);
+            selfUpdating = false;
+          } else if (!(img.src || "").startsWith("data:")) {
+            selfUpdating = true;
+            applyMask(img);
+            selfUpdating = false;
+          }
+        });
+      }
+    });
   });
 
   function observeSrc(img) {
@@ -1150,19 +1151,21 @@
   const lastSwapUrl = new WeakMap();
   const urlSwapObserver = new MutationObserver((mutations) => {
     if (selfUpdating) return;
-    for (const m of mutations) {
-      if (m.type !== "attributes") continue;
-      const img = m.target;
-      if (img.__mastirOverlayPaint) continue;
-      const url = getImageUrl(img);
-      if (!url || url.startsWith("data:")) continue;
-      if (lastSwapUrl.get(img) === url) continue;
-      lastSwapUrl.set(img, url);
-      if (segMaskCache.has(img) && segFetchUrl.get(img) === url) continue;
-      segProcessed.delete(img);
-      segMaskCache.delete(img);
-      enqueueImage(img);
-    }
+    profile("obs.urlSwap", () => {
+      for (const m of mutations) {
+        if (m.type !== "attributes") continue;
+        const img = m.target;
+        if (img.__mastirOverlayPaint) continue;
+        const url = getImageUrl(img);
+        if (!url || url.startsWith("data:")) continue;
+        if (lastSwapUrl.get(img) === url) continue;
+        lastSwapUrl.set(img, url);
+        if (segMaskCache.has(img) && segFetchUrl.get(img) === url) continue;
+        segProcessed.delete(img);
+        segMaskCache.delete(img);
+        enqueueImage(img);
+      }
+    });
   });
 
   function observeUrlSwap(img) {
@@ -1177,10 +1180,12 @@
   window.addEventListener("load", () => {
     if (isTinyFrame) return;
     new MutationObserver(() => {
-      applyBlur();
-      if (!segDebounce) {
-        segDebounce = setTimeout(() => { segDebounce = null; runSegmentation(); }, 500);
-      }
+      profile("obs.bodyChildList", () => {
+        applyBlur();
+        if (!segDebounce) {
+          segDebounce = setTimeout(() => { segDebounce = null; runSegmentation(); }, 500);
+        }
+      });
     }).observe(document.body, { childList: true, subtree: true });
     applyBlur();
     runSegmentation();
