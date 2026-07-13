@@ -1,4 +1,6 @@
 "use strict";
+if (self.__mastirBridgeInjected) { /* already injected */ } else {
+self.__mastirBridgeInjected = true;
 
 chrome.storage.local.get({ blurAmount: 0, maskBlur: 2, maskExpand: 8, grayOn: false }, (s) => {
   window.postMessage({ type: "mastir-settings", ...s }, "*");
@@ -48,3 +50,4 @@ function offscreenReady() {
   }
   return offscreenReadyPromise;
 }
+} // end double-injection guard

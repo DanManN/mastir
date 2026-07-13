@@ -1,6 +1,9 @@
 "use strict";
 
 (function () {
+  // Guard against double-injection (declarative + programmatic both fire).
+  if (window.__mastirInjected) return;
+  window.__mastirInjected = true;
   if (document.contentType?.includes("svg")) return;
 
   const BLUR_CSS = "img, video, video-js, [image-src] { filter: blur(20px) grayscale(100%) !important; clip-path: inset(0); }";
@@ -1148,17 +1151,11 @@
     for (const m of mutations) {
       if (m.type !== "attributes") continue;
       const img = m.target;
-      if (img.__mastirOverlayPaint) continue;              // overlay mode: srcObserver owns it
+      if (img.__mastirOverlayPaint) continue;
       const url = getImageUrl(img);
-      if (!url || url.startsWith("data:")) continue;        // still a placeholder
-      if (lastSwapUrl.get(img) === url) continue;           // no real change
+      if (!url || url.startsWith("data:")) continue;
+      if (lastSwapUrl.get(img) === url) continue;
       lastSwapUrl.set(img, url);
-      // If we already segmented this element, only re-run when the new real URL
-      // differs from the URL we actually segmented (segOriginalSrc). This catches
-      // the startup race where we segmented a data:/placeholder or a low-res
-      // variant and Google later swapped in the real image. When the URL matches
-      // what we segmented, it's benign churn — leave it to srcObserver so we
-      // don't fight Amazon carousels / re-mask needlessly.
       if (segMaskCache.has(img) && segFetchUrl.get(img) === url) continue;
       segProcessed.delete(img);
       segMaskCache.delete(img);

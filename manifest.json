@@ -3,7 +3,7 @@
   "name": "Mastir",
   "version": "1.0",
   "description": "Conceals people in images using person segmentation",
-  "permissions": ["offscreen", "storage", "declarativeNetRequest"],
+  "permissions": ["offscreen", "storage", "declarativeNetRequest", "scripting", "webNavigation"],
   "host_permissions": ["<all_urls>"],
   "declarative_net_request": {
     "rule_resources": [
