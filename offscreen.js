@@ -17,14 +17,18 @@ const MAX_SEG_DIM = 256;
 //   subject (hair/body-skin/face-skin/clothes/accessories). Selfie framing.
 // deeplabv3 (Pascal VOC): 21 classes, person == class 15. General semantic
 //   segmentation — whole clothed body, arbitrary framing, multiple people.
+// selfie_multiclass_256x256 classes:
+//   0=background, 1=hair, 2=body-skin, 3=face-skin, 4=clothes, 5=accessories
+// Output mask labels (sent to content.js):
+//   0=background, 1=person-non-skin, 2=skin
 const MODELS = {
   selfie: {
     asset: "selfie_multiclass_256x256.tflite",
-    isPerson: (c) => c > 0,
+    label: (c) => (c === 2 || c === 3) ? 2 : c > 0 ? 1 : 0,
   },
   deeplab: {
     asset: "deeplabv3.tflite",
-    isPerson: (c) => c === 15,
+    label: (c) => c === 15 ? 2 : 0,
   },
 };
 const ACTIVE_MODEL = "selfie";
@@ -96,7 +100,8 @@ function bytesToBase64(bytes) {
     if (msg.type !== "mastir-segment-offscreen") return false;
     (async () => {
       const seg = await loadSegmenter();
-      const isPerson = MODELS[ACTIVE_MODEL].isPerson;
+      const model = MODELS[ACTIVE_MODEL];
+      const label = model.label;
       const { bitmap } = msg.url
         ? await bitmapFromUrl(msg.url)
         : await bitmapFromPixels(msg.pixelsB64, msg.w, msg.h);
@@ -120,14 +125,14 @@ function bytesToBase64(bytes) {
         mh = Math.max(1, Math.round(fh * mscale));
         raw = new Uint8Array(mw * mh);
         if (mw === fw && mh === fh) {
-          for (let i = 0; i < maskData.length; i++) raw[i] = isPerson(maskData[i]) ? 255 : 0;
+          for (let i = 0; i < maskData.length; i++) raw[i] = label(maskData[i]);
         } else {
           // Nearest-neighbour downsample of the binary person mask.
           for (let y = 0; y < mh; y++) {
             const sy = Math.min(fh - 1, (y / mscale) | 0);
             for (let x = 0; x < mw; x++) {
               const sx = Math.min(fw - 1, (x / mscale) | 0);
-              raw[y * mw + x] = isPerson(maskData[sy * fw + sx]) ? 255 : 0;
+              raw[y * mw + x] = label(maskData[sy * fw + sx]);
             }
           }
         }

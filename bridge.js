@@ -2,7 +2,7 @@
 if (self.__mastirBridgeInjected) { /* already injected */ } else {
 self.__mastirBridgeInjected = true;
 
-chrome.storage.local.get({ blurAmount: 0, maskBlur: 2, maskExpand: 8, grayOn: false }, (s) => {
+chrome.storage.local.get({ blurAmount: 0, maskBlur: 2, maskExpand: 8, grayOn: false, skinOnly: false }, (s) => {
   window.postMessage({ type: "mastir-settings", ...s }, "*");
 });
 

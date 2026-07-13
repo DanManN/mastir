@@ -279,6 +279,7 @@
   let blurAmount = 0;
   let blurOff = true;
   let grayOn = false;
+  let skinOnly = false;
   let maskBlur = 2;
   let maskExpand = 8;
   let blurSpans = circleRowSpans(maskBlur);
@@ -510,22 +511,21 @@
   }
 
   // Process the raw seg-res mask (dilate + blur) then upscale to display res.
+  // Raw mask labels: 0=background, 1=person-non-skin, 2=skin.
+  // When skinOnly is true, only skin pixels (2) are masked.
   function buildMaskAlpha(entry) {
     if (!entry.raw) return new Uint8Array(entry.w * entry.h);
-    // Process in an intermediate box that matches the IMAGE's aspect ratio
-    // (bounded by MAX_SEG_DIM on the long side) rather than the raw seg mask,
-    // which may be square (the model's native output) or otherwise distorted.
-    // Order: (1) reshape raw mask to correct aspect, (2) dilate/blur uniformly
-    // there — cheap, ~256px — (3) upscale to full image with a uniform scale so
-    // the radius stays uniform. Dilating in the distorted seg space instead
-    // would apply the radius non-uniformly (an 8px expand on a squished mask
-    // becomes far larger on the short axis), making the mask look "zoomed in".
+    const threshold = skinOnly ? 2 : 1;
+    const binary = new Uint8Array(entry.raw.length);
+    for (let i = 0; i < entry.raw.length; i++) {
+      binary[i] = entry.raw[i] >= threshold ? 255 : 0;
+    }
     const scale = Math.min(1, MAX_SEG_DIM / Math.max(entry.w, entry.h));
     const iw = Math.max(1, Math.round(entry.w * scale));
     const ih = Math.max(1, Math.round(entry.h * scale));
     const aspectFixed = (entry.sw === iw && entry.sh === ih)
-      ? entry.raw
-      : profile("mask.aspectFix", () => upscaleMask(entry.raw, entry.sw, entry.sh, iw, ih));
+      ? binary
+      : profile("mask.aspectFix", () => upscaleMask(binary, entry.sw, entry.sh, iw, ih));
     const processed = profile("mask.dilateBlur", () => processRawMask(aspectFixed, iw, ih));
     return profile("mask.upscale", () => upscaleMask(processed, iw, ih, entry.w, entry.h));
   }
@@ -1061,6 +1061,8 @@
   window.addEventListener("message", (e) => {
     if (e.data && (e.data.type === "mastir-sync" || e.data.type === "mastir-settings")) {
       if (e.data.grayOn !== undefined) grayOn = e.data.grayOn;
+      const skinChanged = e.data.skinOnly !== undefined && e.data.skinOnly !== skinOnly;
+      if (e.data.skinOnly !== undefined) skinOnly = e.data.skinOnly;
       if (e.data.blurAmount !== undefined) { blurAmount = e.data.blurAmount; blurOff = blurAmount === 0; }
       if (e.data.blurOff !== undefined) blurOff = e.data.blurOff;
       const maskChanged = (e.data.maskBlur !== undefined && e.data.maskBlur !== maskBlur) ||
@@ -1068,7 +1070,7 @@
       if (e.data.maskBlur !== undefined) { maskBlur = e.data.maskBlur; blurSpans = circleRowSpans(maskBlur); }
       if (e.data.maskExpand !== undefined) { maskExpand = e.data.maskExpand; expandSpans = circleRowSpans(maskExpand); }
       applyBlur();
-      if (maskChanged) reprocessMasks();
+      if (maskChanged || skinChanged) reprocessMasks();
       broadcastState();
     }
   });

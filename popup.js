@@ -7,10 +7,12 @@ const maskBlurVal = document.getElementById("mask-blur-val");
 const maskExpandSlider = document.getElementById("mask-expand-slider");
 const maskExpandVal = document.getElementById("mask-expand-val");
 const grayToggle = document.getElementById("gray-toggle");
+const skinToggle = document.getElementById("skin-toggle");
 
 let grayOn = false;
+let skinOnly = false;
 
-const DEFAULTS = { blurAmount: 0, maskBlur: 2, maskExpand: 8, grayOn: false };
+const DEFAULTS = { blurAmount: 0, maskBlur: 2, maskExpand: 8, grayOn: false, skinOnly: false };
 
 function sendSettings(settings) {
   chrome.storage.local.set(settings);
@@ -31,6 +33,9 @@ chrome.storage.local.get(DEFAULTS, (s) => {
   grayOn = s.grayOn;
   grayToggle.textContent = "Grayscale: " + (grayOn ? "On" : "Off");
   grayToggle.classList.toggle("active", grayOn);
+  skinOnly = s.skinOnly;
+  skinToggle.textContent = "Skin Only: " + (skinOnly ? "On" : "Off");
+  skinToggle.classList.toggle("active", skinOnly);
 });
 
 blurSlider.addEventListener("input", () => {
@@ -57,4 +62,11 @@ grayToggle.addEventListener("click", () => {
   grayToggle.textContent = "Grayscale: " + (grayOn ? "On" : "Off");
   grayToggle.classList.toggle("active", grayOn);
   sendSettings({ grayOn });
+});
+
+skinToggle.addEventListener("click", () => {
+  skinOnly = !skinOnly;
+  skinToggle.textContent = "Skin Only: " + (skinOnly ? "On" : "Off");
+  skinToggle.classList.toggle("active", skinOnly);
+  sendSettings({ skinOnly });
 });
