@@ -6,7 +6,7 @@
   window.__mastirInjected = true;
   if (document.contentType?.includes("svg")) return;
 
-  const BLUR_CSS = "img, video, video-js, [image-src] { filter: blur(20px) grayscale(100%) !important; clip-path: inset(0); }";
+  const BLUR_CSS = "img, video, video-js, [image-src] { filter: blur(32px) grayscale(100%) !important; clip-path: inset(0); }";
 
   // Inject a CSS rule immediately so images are blurred/grayscaled before they even render
   let styleInjected = false;
@@ -156,7 +156,7 @@
     });
   }).observe(document.documentElement, { childList: true, subtree: true });
 
-  const MAX_BLUR = "blur(20px) grayscale(100%)";
+  const MAX_BLUR = "blur(32px) grayscale(100%)";
 
   // --- Profiling ---
   const MASTIR_PROFILE = true;
