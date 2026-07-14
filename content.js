@@ -6,7 +6,13 @@
   window.__mastirInjected = true;
   if (document.contentType?.includes("svg")) return;
 
-  const BLUR_CSS = "img, video, video-js, [image-src] { filter: blur(32px) grayscale(100%) !important; clip-path: inset(0); }";
+  // Full-strength concealment: heavy blur + full desaturation. Applied to any
+  // image not yet cleared by segmentation, and permanently to videos/animated
+  // content. Single source of truth for blur strength — BLUR_CSS derives from it.
+  const MAX_BLUR = "blur(32px) grayscale(100%)";
+  // Global rule injected at document_start so images are concealed before they
+  // ever paint. clip-path: inset(0) keeps the blur from bleeding past the box.
+  const BLUR_CSS = `img, video, video-js, [image-src] { filter: ${MAX_BLUR} !important; clip-path: inset(0); }`;
 
   // Inject a CSS rule immediately so images are blurred/grayscaled before they even render
   let styleInjected = false;
@@ -130,6 +136,13 @@
     }
   }
 
+  // Shared childList-observer callback: pre-blur/observe every newly-added node.
+  function processMutations(mutations) {
+    for (const m of mutations) {
+      for (const node of m.addedNodes) processNode(node);
+    }
+  }
+
   function processShadowRoot(root) {
     // Skip the <style> injection when we already know the page's style-src
     // rejects it — it would just emit a CSP violation per shadow root.
@@ -141,42 +154,35 @@
       root.prepend(style);
     }
     root.querySelectorAll("*").forEach(handleElement);
-    new MutationObserver((mutations) => {
-      for (const m of mutations) {
-        for (const node of m.addedNodes) processNode(node);
-      }
-    }).observe(root, { childList: true, subtree: true });
+    new MutationObserver(processMutations).observe(root, { childList: true, subtree: true });
   }
 
   new MutationObserver((mutations) => {
-    profile("obs.docChildList", () => {
-      for (const m of mutations) {
-        for (const node of m.addedNodes) processNode(node);
-      }
-    });
+    profile("obs.docChildList", () => processMutations(mutations));
   }).observe(document.documentElement, { childList: true, subtree: true });
 
-  const MAX_BLUR = "blur(32px) grayscale(100%)";
-
   // --- Profiling ---
+  // Wrap any function in profile()/profileAsync() to accumulate call count,
+  // total, and max time under `label`. Dump the table from the console with
+  // window.mastirProfile(). Flip MASTIR_PROFILE to false to make it a no-op.
   const MASTIR_PROFILE = true;
   const profileStats = {};
+  function recordStat(label, elapsed) {
+    const s = profileStats[label] || (profileStats[label] = { n: 0, total: 0, max: 0 });
+    s.n++; s.total += elapsed; s.max = Math.max(s.max, elapsed);
+  }
   function profile(label, fn) {
     if (!MASTIR_PROFILE) return fn();
     const t0 = performance.now();
     const r = fn();
-    const dt = performance.now() - t0;
-    const s = profileStats[label] || (profileStats[label] = { n: 0, total: 0, max: 0 });
-    s.n++; s.total += dt; s.max = Math.max(s.max, dt);
+    recordStat(label, performance.now() - t0);
     return r;
   }
   async function profileAsync(label, fn) {
     if (!MASTIR_PROFILE) return fn();
     const t0 = performance.now();
     const r = await fn();
-    const dt = performance.now() - t0;
-    const s = profileStats[label] || (profileStats[label] = { n: 0, total: 0, max: 0 });
-    s.n++; s.total += dt; s.max = Math.max(s.max, dt);
+    recordStat(label, performance.now() - t0);
     return r;
   }
   if (MASTIR_PROFILE) {
@@ -278,22 +284,26 @@
     c.toBlob((b) => console.log("[mastir] mask preview blob:", URL.createObjectURL(b)));
   };
 
-  let blurAmount = 0;
-  let blurOff = true;
-  let grayOn = false;
-  let skinOnly = false;
-  let maskBlur = 2;
-  let maskExpand = 8;
+  // --- Live settings (kept in sync with the popup via postMessage) ---
+  let blurAmount = 0;       // global blur strength applied to ALL images (px)
+  let blurOff = true;       // true when blurAmount === 0 (no global blur)
+  let grayOn = false;       // desaturate all images
+  let skinOnly = false;     // conceal only skin pixels, not the whole person
+  let maskBlur = 2;         // softness of the mask edge (px radius)
+  let maskExpand = 8;       // grow the mask outward (px radius)
+  // Precomputed circular kernels for the mask blur/expand radii; recomputed
+  // whenever the corresponding setting changes.
   let blurSpans = circleRowSpans(maskBlur);
   let expandSpans = circleRowSpans(maskExpand);
 
   // --- Person Segmentation ---
-  const segProcessed = new WeakSet();
-  const segOriginalSrc = new WeakMap();
-  const segFetchUrl = new WeakMap();
-  const segMaskCache = new WeakMap();
-  const segAllElements = new Set();
-  const segUrlCache = new Map();
+  // Per-image bookkeeping. WeakMap/WeakSet so entries vanish with the element.
+  const segProcessed = new WeakSet();       // images we've already handled
+  const segOriginalSrc = new WeakMap();     // img -> src before we rewrote it
+  const segFetchUrl = new WeakMap();        // img -> exact URL we segmented
+  const segMaskCache = new WeakMap();       // img -> { originalPixels, maskAlpha, raw, ... }
+  const segAllElements = new Set();         // every segmented element (for applyBlur/reprocess)
+  const segUrlCache = new Map();            // url -> cached mask, shared across identical images
 
   // --- Bridge communication ---
   function bridgeRequest(type, payload, timeoutMs = 10000) {
@@ -578,6 +588,13 @@
   }
 
   async function segment(fetchUrl, bitmap) {
+    // Ask the offscreen doc to segment `payload` and decode its raw-mask reply.
+    const requestSeg = async (payload) => {
+      const resp = await profileAsync("seg.roundtrip", () => bridgeRequest("mastir-segment", payload, 20000));
+      if (resp.error) throw new Error(resp.error);
+      const raw = profile("seg.decode", () => resp.rawB64 ? base64ToBytes(resp.rawB64) : null);
+      return { raw, sw: resp.w, sh: resp.h };
+    };
     // Fast path: for http(s) URLs, let the offscreen doc fetch full-res itself
     // (sharper mask, no bridge transfer). If that fails — e.g. the offscreen's
     // fetch hits CORS on an image whose bytes we ALREADY have in `bitmap` (wiki
@@ -585,19 +602,12 @@
     // — fall back to shipping the decoded pixels across the bridge.
     if (/^https?:/.test(fetchUrl)) {
       try {
-        const resp = await profileAsync("seg.roundtrip", () => bridgeRequest("mastir-segment", { url: fetchUrl }, 20000));
-        const raw = profile("seg.decode", () => resp.rawB64 ? base64ToBytes(resp.rawB64) : null);
-        return { raw, sw: resp.w, sh: resp.h };
+        return await requestSeg({ url: fetchUrl });
       } catch (e) {
-        // Offscreen URL fetch failed (e.g. CORS on an S3-redirected wiki image
-        // whose bytes we already have). Fall through to the pixel path.
         console.debug("[mastir] URL segment failed, retrying with pixels:", e.message);
       }
     }
-    const resp = await profileAsync("seg.roundtrip", () => bridgeRequest("mastir-segment", encodePixels(bitmap), 20000));
-    if (resp.error) throw new Error(resp.error);
-    const raw = profile("seg.decode", () => resp.rawB64 ? base64ToBytes(resp.rawB64) : null);
-    return { raw, sw: resp.w, sh: resp.h };
+    return requestSeg(encodePixels(bitmap));
   }
 
   const IMG_URL_ATTR_RE = /\.(jpe?g|png|webp|avif|bmp)(\?|$)/i;
@@ -674,6 +684,10 @@
     if (segProcessed.has(img)) return;
     if (isVideoIframe(img)) { segProcessed.add(img); return; }
     const imageSrcAttr = img.getAttribute("image-src");
+    // `src` is what's DISPLAYED (currentSrc/img.src, may be a data:-URI
+    // placeholder) — used for the SVG check and as the restore point. It
+    // deliberately differs from the `fetchUrl` below (getImageUrl prefers a real
+    // http(s) URL to actually segment); don't collapse the two.
     const src = img.tagName === "VIDEO"
       ? getImageUrl(img)
       : (imageSrcAttr || img.currentSrc || img.src || getImageUrl(img));
@@ -916,8 +930,9 @@
     if (img.tagName === "IMG" && !img.__mastirOverlayPaint) observeSrc(img);
   }
 
-
-
+  // Segmentation queue with a small worker pool. Each roundtrip to the offscreen
+  // doc is GPU-bound and slow (~100ms+), so we cap concurrency to avoid flooding
+  // the bridge; images past the cap wait in segQueue until a worker frees up.
   const segQueue = [];
   const SEG_CONCURRENCY = 2;
   let segWorkers = 0;
@@ -1052,8 +1067,6 @@
       applyMask(img);
     });
   }
-
-
 
   function broadcastState() {
     const msg = { type: "mastir-sync", blurOff, grayOn, blurAmount };
