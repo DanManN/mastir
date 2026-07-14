@@ -192,6 +192,23 @@
     };
   }
 
+  // Buffer every mastir diagnostic line in memory instead of racing it against
+  // the host page's own console spam (Google Images floods gen_204 errors).
+  // Dump with window.mastirLog() or filter with window.mastirLog("skip") /
+  // window.mastirLog("ANd9GcT..."). Clear with window.mastirLog.clear().
+  const mastirLogBuffer = [];
+  function mlog(msg) {
+    if (!MASTIR_PROFILE) return;
+    mastirLogBuffer.push(msg);
+  }
+  if (MASTIR_PROFILE) {
+    window.mastirLog = (filter) => {
+      const lines = filter ? mastirLogBuffer.filter((l) => l.includes(filter)) : mastirLogBuffer;
+      console.log(`[mastir] ${lines.length} log line(s)${filter ? ` matching "${filter}"` : ""}:\n` + lines.join("\n"));
+    };
+    window.mastirLog.clear = () => { mastirLogBuffer.length = 0; };
+  }
+
   // Debug: overlay the computed mask (red, semi-transparent) on the ORIGINAL
   // image pixels so alignment can be inspected directly. Call from the console:
   //   mastirDebugMask(0)  — index into the currently segmented elements
@@ -666,7 +683,11 @@
   // blurred (fail-safe for images we couldn't inspect — 404/CORS/decode — so we
   // never reveal something unexamined). keepBlur=false reveals per the global
   // preference (SVG/GIF/tiny images that are safe to show).
-  function markDone(img, keepBlur = false) {
+  function markDone(img, keepBlur = false, reason = "") {
+    if (MASTIR_PROFILE) {
+      const u = (getImageUrl(img) || img.currentSrc || img.src || "").slice(0, 90);
+      mlog(`[mastir:skip] markDone keepBlur=${keepBlur} reason=${reason} nat=${img.naturalWidth}x${img.naturalHeight} ${u}`);
+    }
     segProcessed.add(img);
     segMaskCache.set(img, { originalPixels: null, maskAlpha: new Uint8Array(0), raw: null, sw: 0, sh: 0, w: 0, h: 0 });
     segAllElements.add(img);
@@ -691,14 +712,29 @@
     const src = img.tagName === "VIDEO"
       ? getImageUrl(img)
       : (imageSrcAttr || img.currentSrc || img.src || getImageUrl(img));
-    if (!src) return;
+    if (!src) { mlog("[mastir:skip] no src"); return; }
     if (img.tagName === "IMG" && !imageSrcAttr) {
       if (img.naturalWidth === 0 || img.naturalHeight === 0) {
+        mlog(`[mastir:skip] not decoded (nat 0), waiting for load: ${src.slice(0, 90)}`);
         img.addEventListener("load", () => enqueueImage(img), { once: true });
         return;
       }
       if (img.naturalWidth < 48 || img.naturalHeight < 48) {
-        markDone(img);
+        // A tiny NATURAL size can mean two very different things:
+        //  - a genuine small icon (favicon, avatar) — safe to reveal, and
+        //  - a not-yet-loaded placeholder (Google's deferred grid images sit at
+        //    1x1 until scrolled near, then load real bytes IN PLACE without
+        //    changing src — so urlSwapObserver never re-fires).
+        // Tell them apart by the RENDERED box: a real icon is laid out small,
+        // a placeholder for a grid photo is laid out large. If it's displayed
+        // large, leave it blurred and re-process on load rather than revealing
+        // it permanently.
+        if (img.offsetWidth >= 48 && img.offsetHeight >= 48) {
+          mlog(`[mastir:skip] tiny natural (${img.naturalWidth}x${img.naturalHeight}) but rendered ${img.offsetWidth}x${img.offsetHeight} — placeholder, waiting for load: ${src.slice(0, 90)}`);
+          img.addEventListener("load", () => enqueueImage(img), { once: true });
+          return;
+        }
+        markDone(img, false, "tiny");
         return;
       }
     }
@@ -709,20 +745,21 @@
     // segmenting. GIFs are raster and CAN contain people, so they go through
     // normal segmentation (first frame) rather than being blanket-revealed.
     if (/\.svg(\?|$)/i.test(src) || /^data:image\/svg/i.test(src)) {
-      markDone(img);
+      markDone(img, false, "svg");
       return;
     }
     segOriginalSrc.set(img, src);
 
     try {
       const fetchUrl = getImageUrl(img);
-      if (!fetchUrl) return;
+      if (!fetchUrl) { mlog("[mastir:skip] no fetchUrl"); return; }
       // Record the exact URL we segment, so urlSwapObserver can tell a genuine
       // content swap (re-segment) from benign churn of the same URL.
       segFetchUrl.set(img, fetchUrl);
 
       if (segUrlCache.has(fetchUrl)) {
         const cached = segUrlCache.get(fetchUrl);
+        mlog(`[mastir:skip] URL-cache hit hasPerson=${cached.hasPerson} ${fetchUrl.slice(0, 90)}`);
         const entry = { originalPixels: cached.originalPixels.slice(), raw: cached.raw, sw: cached.sw, sh: cached.sh, w: cached.w, h: cached.h };
         entry.maskAlpha = buildMaskAlpha(entry);
         segMaskCache.set(img, entry);
@@ -735,6 +772,11 @@
 
       const { raw, sw, sh } = await segment(fetchUrl, bitmap);
       const w = bitmap.width, h = bitmap.height;
+      if (MASTIR_PROFILE) {
+        let personPx = 0;
+        if (raw) for (let i = 0; i < raw.length; i++) if (raw[i] > 0) personPx++;
+        mlog(`[mastir] seg  bitmap=${w}x${h}  mask=${sw}x${sh}  person=${personPx}/${raw ? raw.length : 0}  ${fetchUrl.slice(0, 90)}`);
+      }
       const canvas = document.createElement("canvas");
       canvas.width = w;
       canvas.height = h;
@@ -753,10 +795,10 @@
       // reveal an image we couldn't inspect. HTTP 4xx (404/403/410) are dead or
       // forbidden URLs; CORS/decode failures won't change on retry either.
       if (/CORS|blocked|decode failed|blob load failed|HTTP 4\d\d/i.test(e.message)) {
-        markDone(img, true);
+        markDone(img, true, "unreadable:" + e.message.slice(0, 30));
       } else if (/SVG|natural dimensions|createImageBitmap|Assertion/i.test(e.message)) {
         // Benign non-images (SVG/GIF/undecodable vector) — safe to reveal.
-        markDone(img);
+        markDone(img, false, "benign:" + e.message.slice(0, 30));
       } else {
         segProcessed.delete(img);
         const retries = (img.__mastirRetries || 0) + 1;
