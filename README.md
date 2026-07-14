@@ -25,10 +25,10 @@ That means what you see becomes part of you. And certainly, what you see influen
 
 Click the extension icon to open the popup. All changes apply immediately.
 
-| Setting | What it does |
+| Setting&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; | What it does |
 |---------|-------------|
-| **Blur** (0–32) | Blurs **all** images on the page by this amount. At 0, images are sharp but detected persons are still concealed with a flat color fill. |
-| **Mask blur** (0–32) | Controls how soft the edges of the person mask are. 0 = hard cutoff, higher = gradual fade between concealed and visible areas. |
-| **Mask expand** (0–32) | Grows the person mask outward by this many pixels. Useful for covering hair edges or limbs the model barely missed. |
+| **Blur**&nbsp;(0&#8209;32) | Blurs **all** images on the page by this amount. At 0, images are sharp but detected persons are still concealed with a flat color fill. |
+| **Mask&nbsp;blur**&nbsp;(0&#8209;32) | Controls how soft the edges of the person mask are. 0 = hard cutoff, higher = gradual fade between concealed and visible areas. |
+| **Mask&nbsp;expand**&nbsp;(0&#8209;32) | Grows the person mask outward by this many pixels. Useful for covering hair edges or limbs the model barely missed. |
 | **Grayscale** | Turns all images black-and-white (applied on top of blur). |
-| **Skin Only** | Only conceals exposed skin (face and body). Hair, clothes, and accessories remain visible. |
+| **Skin&nbsp;Only** | Only conceals exposed skin (face and body). Hair, clothes, and accessories remain visible. |
