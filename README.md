@@ -27,8 +27,8 @@ Click the extension icon to open the popup. All changes apply immediately.
 
 | Setting&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; | What it does |
 |---------|-------------|
+| **Grayscale** | Turns **all** images black-and-white. |
 | **Blur**&nbsp;(0&#8209;32) | Blurs **all** images on the page by this amount. At 0, images are sharp but detected persons are still concealed with a flat color fill. |
 | **Mask&nbsp;blur**&nbsp;(0&#8209;32) | Controls how soft the edges of the person mask are. 0 = hard cutoff, higher = gradual fade between concealed and visible areas. |
 | **Mask&nbsp;expand**&nbsp;(0&#8209;32) | Grows the person mask outward by this many pixels. Useful for covering hair edges or limbs the model barely missed. |
-| **Grayscale** | Turns all images black-and-white (applied on top of blur). |
 | **Skin&nbsp;Only** | Only conceals exposed skin (face and body). Hair, clothes, and accessories remain visible. |

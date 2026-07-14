@@ -14,10 +14,13 @@
 <body>
 <h3>Mastir</h3>
 <div class="section">
+  <h4 style="margin: 0 0 8px; font-size: 13px; text-align: center;">Image settings</h4>
   <label>Blur: <input type="range" id="blur-slider" min="0" max="32" value="0"> <span id="blur-val">0</span></label>
+  <div class="toggle" id="gray-toggle">Grayscale: Off</div>
+  <hr style="margin: 8px 0; border: none; border-top: 1px solid #ddd;">
+  <h4 style="margin: 0 0 8px; font-size: 13px; text-align: center;">Mask settings</h4>
   <label>Mask blur: <input type="range" id="mask-blur-slider" min="0" max="32" value="2"> <span id="mask-blur-val">2</span></label>
   <label>Mask expand: <input type="range" id="mask-expand-slider" min="0" max="32" value="8"> <span id="mask-expand-val">8</span></label>
-  <div class="toggle" id="gray-toggle">Grayscale: Off</div>
   <div class="toggle" id="skin-toggle" style="margin-top: 8px;">Skin Only: Off</div>
 </div>
 <script src="popup.js"></script>
