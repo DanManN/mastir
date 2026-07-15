@@ -1079,6 +1079,20 @@
     document.querySelectorAll("video[poster]").forEach(observeElement);
   }
 
+  // Eagerly segment every image, not just the ones scrolled into view. The
+  // visible ones are already enqueued by the IntersectionObserver, so this just
+  // drains the offscreen remainder in the background. Matters for Chrome's
+  // Reading Mode: it distills the tab's LIVE DOM into a browser-internal panel
+  // extensions can't touch — images we've already masked carry over (their src
+  // is our painted data-URL), unprocessed ones appear unconcealed. Runs on
+  // idle, a few seconds after load, so visible images always get first turn.
+  function eagerSegmentAll() {
+    document.querySelectorAll("img, video[poster]").forEach((el) => {
+      if (segProcessed.has(el) || segMaskCache.has(el)) return;
+      enqueueImage(el);
+    });
+  }
+
 
   // --- UI ---
 
@@ -1244,5 +1258,10 @@
     }).observe(document.body, { childList: true, subtree: true });
     applyBlur();
     runSegmentation();
+    // Once visible images have had their turn, drain the offscreen remainder in
+    // the background so a later Reading Mode (or Ctrl+F jump) finds them masked.
+    const scheduleEager = () => setTimeout(eagerSegmentAll, 3000);
+    if (window.requestIdleCallback) requestIdleCallback(scheduleEager);
+    else scheduleEager();
   });
 })();
