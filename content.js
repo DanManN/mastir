@@ -207,6 +207,7 @@
       console.log(`[mastir] ${lines.length} log line(s)${filter ? ` matching "${filter}"` : ""}:\n` + lines.join("\n"));
     };
     window.mastirLog.clear = () => { mastirLogBuffer.length = 0; };
+    window.mastirBuild = "lazy-overlay-bg";
   }
 
   // Debug: overlay the computed mask (red, semi-transparent) on the ORIGINAL
@@ -706,6 +707,22 @@
     }
     const attrUrl = attrImageUrl(el);
     if (attrUrl) return attrUrl;
+    // Lazy-load plugins (WP LazyLoad, WP-Rocket, UAGB) keep the real image in
+    // data-lazy-src / data-src (or the srcset equivalents) while src shows a
+    // transparent data: placeholder. These URLs are often RELATIVE, which
+    // attrImageUrl rejects — resolve them to absolute so the first pass segments
+    // the real image instead of the placeholder (which reveals, having no person).
+    const lazySrc = el.getAttribute("data-lazy-src") || el.getAttribute("data-src");
+    if (isReal(lazySrc)) return new URL(lazySrc, location.href).href;
+    const lazySrcset = el.getAttribute("data-lazy-srcset") || el.getAttribute("data-srcset");
+    if (lazySrcset) {
+      const best = lazySrcset.split(",")
+        .map((c) => c.trim())
+        .map((c) => { const [url, d] = c.split(/\s+/); return { url, w: parseFloat(d) || 0 }; })
+        .filter((c) => c.url && !c.url.startsWith("data:"))
+        .sort((a, b) => b.w - a.w)[0];
+      if (best) return new URL(best.url, location.href).href;
+    }
     // Last resort: a data:-URI placeholder is still a real, viewable image —
     // segment its pixels rather than skipping the element entirely.
     return el.currentSrc || el.src || null;
@@ -1010,6 +1027,18 @@
         ctx.putImageData(new ImageData(new Uint8ClampedArray(pixels), w, h), 0, 0);
         return canvas.toDataURL("image/png");
       });
+      // When the PAGE owns src (a lazy-loader will keep writing it), painting
+      // into src is a war we can't win — the loader swaps its real/placeholder
+      // URL back in and reveals the person until srcObserver reacts a frame
+      // later. Detect this up front (lazy-* attrs present, or src is still a
+      // transparent data: placeholder while we segmented a real image) and paint
+      // as an OVERLAY instead: the mask sits on top and src can churn freely
+      // underneath. Makes what's displayed match what we segmented, structurally.
+      const displayed = img.currentSrc || img.src || "";
+      const pageOwnsSrc = img.hasAttribute("data-lazy-src") || img.hasAttribute("data-src") ||
+        img.hasAttribute("data-lazy-srcset") || img.hasAttribute("data-srcset") ||
+        displayed.startsWith("data:");
+      if (pageOwnsSrc) img.__mastirOverlayPaint = true;
       if ((img.tagName === "IMG" && isDirectImageView) || img.__mastirOverlayPaint) {
         paintOverlay(img, dataUrl);
       } else if (img.tagName === "IMG") {
@@ -1018,6 +1047,7 @@
         if (picture) picture.querySelectorAll("source").forEach((s) => s.remove());
         img.removeAttribute("srcset");
         img.src = dataUrl;
+        img.__mastirPaintedSrc = dataUrl;
         selfUpdating = false;
       } else if (img.tagName === "VIDEO") {
         img.setAttribute("poster", dataUrl);
@@ -1301,7 +1331,12 @@
         if (img.__mastirOverlayPaint) continue; // already overlay-mode
         if (!segMaskCache.has(img)) continue;
         const current = img.src || "";
-        if (current.startsWith("data:")) continue;
+        // Skip only OUR OWN painted mask — not every data: URL. A lazy-loader
+        // (WP LazyLoad on UAGB blocks) swaps src back to its transparent data:
+        // placeholder AFTER we paint, clobbering the mask; that foreign data:
+        // must fall through to the reapply/overlay path below, or the image is
+        // left revealed. getImageUrl resolves the real image from data-lazy-*.
+        if (current === img.__mastirPaintedSrc) continue;
 
         // Src swapped to an animated image (e.g. YouTube's hover preview over a
         // revealed thumbnail) — moving content we can't fully segment. Blur it
@@ -1323,14 +1358,19 @@
         requestAnimationFrame(() => {
           srcReapplyPending.delete(img);
           if (!segMaskCache.has(img)) return;
-          if (count >= MAX_INPLACE_REAPPLIES) {
+          // Escalate to overlay when we've lost the src war too many times, OR
+          // the page reset src to a data: placeholder (a lazy-loader owns src
+          // and will keep clobbering an in-place mask — we can never win by
+          // rewriting src, so paint on top immediately). Overlay uses the
+          // segmented real image, so the person stays concealed regardless.
+          if (count >= MAX_INPLACE_REAPPLIES || (img.src || "").startsWith("data:")) {
             img.__mastirOverlayPaint = true;
             srcObserver.unobserve(img);
             img.style.setProperty("filter", buildFilter(!blurOff), "important");
             selfUpdating = true;
             applyMask(img);
             selfUpdating = false;
-          } else if (!(img.src || "").startsWith("data:")) {
+          } else {
             selfUpdating = true;
             applyMask(img);
             selfUpdating = false;
@@ -1359,7 +1399,7 @@
   // element and only act once writes go quiet, reading what's ACTUALLY
   // displayed then. Pre-blur means nothing is revealed during the settle window.
   const swapSettleTimers = new WeakMap();
-  const SWAP_SETTLE_MS = 150;
+  const SWAP_SETTLE_MS = 500;
   const urlSwapObserver = new MutationObserver((mutations) => {
     if (selfUpdating) return;
     profile("obs.urlSwap", () => {
