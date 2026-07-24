@@ -214,6 +214,27 @@
   //   mastirDebugMask(0)  — index into the currently segmented elements
   //   mastirDebugMask(document.querySelectorAll('img')[3])  — or pass an element
   // Opens a data URL in a new tab showing original + red mask.
+  // Debug: dump an element's full tracking state (processed? cached? which URL
+  // did we segment? does the cached mask have a person?). Answers "why isn't
+  // THIS image concealed" without needing the closure-scoped maps in scope.
+  //   mastirState($0)
+  window.mastirState = (img) => {
+    if (!img) { console.warn("[mastir] pass an element"); return; }
+    const cached = segMaskCache.get(img);
+    console.log("[mastir] state", {
+      tag: img.tagName,
+      currentSrc: (img.currentSrc || img.src || "").slice(0, 80),
+      liveFetchUrl: (getImageUrl(img) || "").slice(0, 80),
+      segFetchUrl: (segFetchUrl.get(img) || "").slice(0, 80),
+      processed: segProcessed.has(img),
+      hasCache: !!cached,
+      hasPerson: cached ? cached.hasPerson : undefined,
+      overlayPaint: !!img.__mastirOverlayPaint,
+      forceBlur: !!img.__mastirForceBlur,
+      filter: img.style.filter,
+    });
+  };
+
   window.mastirDebugMask = (target) => {
     let img = target;
     if (typeof target === "number") img = [...segAllElements][target];
@@ -734,6 +755,20 @@
           img.addEventListener("load", () => enqueueImage(img), { once: true });
           return;
         }
+        // naturalWidth can be STALE right after a src swap: it keeps reporting
+        // the PREVIOUS decode's size (e.g. a 1x1 placeholder) until the new bytes
+        // decode. urlSwapObserver re-enqueues the instant src changes, so we can
+        // arrive here before the real image has decoded and wrongly judge a
+        // full-size photo as a tiny icon (Outlook re-vends blob: URLs this way,
+        // and markDone would reveal the person permanently). decode() resolves
+        // only once the CURRENT src is decoded — recheck the size after it, and
+        // re-segment if it turns out to be full-size after all.
+        try { await img.decode(); } catch (e) { /* undecodable — fall through */ }
+        if (img.naturalWidth >= 48 && img.naturalHeight >= 48) {
+          mlog(`[mastir:skip] tiny was stale — decoded to ${img.naturalWidth}x${img.naturalHeight}, re-segmenting: ${src.slice(0, 90)}`);
+          enqueueImage(img);
+          return;
+        }
         markDone(img, false, "tiny");
         return;
       }
@@ -1230,6 +1265,10 @@
         if (lastSwapUrl.get(img) === url) continue;
         lastSwapUrl.set(img, url);
         if (segMaskCache.has(img) && segFetchUrl.get(img) === url) continue;
+        if (MASTIR_PROFILE) {
+          const prev = segFetchUrl.get(img) || "";
+          mlog(`[mastir:urlSwap] WIPE hadCache=${segMaskCache.has(img)} prev=${prev.slice(0, 50)} new=${url.slice(0, 50)}`);
+        }
         segProcessed.delete(img);
         segMaskCache.delete(img);
         enqueueImage(img);
