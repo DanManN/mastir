@@ -661,6 +661,17 @@
     return null;
   }
 
+  // Compare two image URLs by their resolved absolute form, so a relative src
+  // ("/path.png") and its absolute equivalent ("https://host/path.png") — the
+  // same image — compare equal. Falls back to raw equality for unresolvable
+  // (blob:/data:) URLs.
+  function sameUrl(a, b) {
+    if (a === b) return true;
+    if (!a || !b) return false;
+    try { return new URL(a, location.href).href === new URL(b, location.href).href; }
+    catch (e) { return false; }
+  }
+
   function getImageUrl(el) {
     if (el.tagName === "VIDEO") {
       return el.getAttribute("poster") || null;
@@ -725,6 +736,25 @@
   async function processImage(img) {
     if (segProcessed.has(img)) return;
     if (isVideoIframe(img)) { segProcessed.add(img); return; }
+    // A result is safe to apply only if it's still the newest run for this
+    // element AND the element still displays the URL we segmented. Instagram
+    // Feed churns src webp<->placeholder rapidly, so segmentations finish out of
+    // order and for URLs the element no longer shows. Returns true (and handles
+    // re-triggering) when this run must NOT apply its result:
+    //  - gen bumped: a newer run was enqueued (urlSwapObserver clears
+    //    segProcessed + re-enqueues on a swap) — it will apply; we just drop.
+    //  - url changed but gen same: the swap didn't re-enqueue (dedup/selfUpdating
+    //    collapsed it), so nothing else will fix this element — re-enqueue it.
+    const gen = img.__mastirGen;
+    const isStale = (fetchUrl) => {
+      if (img.__mastirGen !== gen) return true;
+      if (fetchUrl !== undefined && !sameUrl(getImageUrl(img), fetchUrl)) {
+        segProcessed.delete(img);
+        enqueueImage(img);
+        return true;
+      }
+      return false;
+    };
     const imageSrcAttr = img.getAttribute("image-src");
     // `src` is what's DISPLAYED (currentSrc/img.src, may be a data:-URI
     // placeholder) — used for the SVG check and as the restore point. It
@@ -779,7 +809,12 @@
     // SVGs are vector (no photographic people) and safe to reveal without
     // segmenting. GIFs are raster and CAN contain people, so they go through
     // normal segmentation (first frame) rather than being blanket-revealed.
-    if (/\.svg(\?|$)/i.test(src) || /^data:image\/svg/i.test(src)) {
+    // Test the URL we'd actually SEGMENT, not the displayed `src`: lazy-load
+    // plugins set src to an inline SVG placeholder while the real raster image
+    // waits in srcset/data-src, and testing src would reveal that photo as a
+    // bogus "vector" (getImageUrl already skips data: placeholders).
+    const svgUrl = getImageUrl(img) || src;
+    if (/\.svg(\?|$)/i.test(svgUrl) || /^data:image\/svg/i.test(svgUrl)) {
       markDone(img, false, "svg");
       return;
     }
@@ -794,6 +829,11 @@
 
       if (segUrlCache.has(fetchUrl)) {
         const cached = segUrlCache.get(fetchUrl);
+        // Superseded (newer run) or the element no longer shows this url — drop.
+        if (isStale(fetchUrl)) {
+          mlog(`[mastir:skip] stale before cache-apply, dropping ${fetchUrl.slice(0, 60)}`);
+          return;
+        }
         mlog(`[mastir:skip] URL-cache hit hasPerson=${cached.hasPerson} ${fetchUrl.slice(0, 90)}`);
         const entry = { originalPixels: cached.originalPixels.slice(), raw: cached.raw, sw: cached.sw, sh: cached.sh, w: cached.w, h: cached.h };
         entry.maskAlpha = buildMaskAlpha(entry);
@@ -820,7 +860,19 @@
 
       const cacheEntry = { originalPixels, raw, sw, sh, w, h };
       cacheEntry.maskAlpha = buildMaskAlpha(cacheEntry);
+      // Cache the result by URL regardless — it's valid for that URL and reused
+      // if the element (or another) shows it again.
       segUrlCache.set(fetchUrl, cacheEntry);
+
+      // Superseded (newer run) or the element no longer shows this url while
+      // segmentation was in flight. The URL cache above keeps our result for
+      // reuse, but don't apply it here — the current generation / current url
+      // will. Closes the completion-ordering race per-URL guards alone can't.
+      if (isStale(fetchUrl)) {
+        mlog(`[mastir:skip] stale mid-segment, dropping ${fetchUrl.slice(0, 60)}`);
+        return;
+      }
+
       segMaskCache.set(img, cacheEntry);
       segAllElements.add(img);
       applyMask(img);
@@ -1053,12 +1105,76 @@
       blurElement(img);
       return;
     }
+    // Bump a per-image generation token on every (re)enqueue. processImage
+    // captures it at start and only applies its result if the token is still
+    // current — so when a churning lazy-load src (Instagram Feed swaps
+    // webp<->placeholder rapidly) re-enqueues an image, a slower in-flight
+    // segmentation that finishes LATER can't clobber the newest one. Closes the
+    // completion-ordering race that per-URL guards can't (both may pass their
+    // URL check yet still apply out of order).
+    img.__mastirGen = (img.__mastirGen || 0) + 1;
     segQueue.push(img);
     processQueue();
   }
 
 
   const SKIP_BG_TAGS = new Set(["SCRIPT", "STYLE", "LINK", "META", "BR", "HR", "INPUT", "TEXTAREA", "SELECT", "BUTTON", "SVG", "PATH", "IMG"]);
+
+  // Resolve a non-img element's background image and enqueue it for masking.
+  // Returns true once handled (or watched for a later lazy-bg), false if the
+  // element has no usable background and isn't worth watching.
+  function handleBgElement(el) {
+    if (segProcessed.has(el) || segMaskCache.has(el)) return true;
+    if (el.offsetWidth < 48 || el.offsetHeight < 48) return true;
+    const bg = getComputedStyle(el).backgroundImage;
+    const match = bg && bg !== "none" ? bg.match(/url\(["']?([^"')]+)["']?\)/) : null;
+    let url = match ? match[1] : null;
+    // Only fall back to an attribute-stored URL (data-png, landscape-src,
+    // etc.) when the element ISN'T just a container around a real <img>.
+    // Grid cells like flaticon's <li data-png="…512/….png"> hold the icon
+    // URL in an attribute but render it via a child <img> that we already
+    // segment — treating the <li> as an image too paints a cover-sized
+    // overlay over the whole cell and blows the layout up.
+    if (!url && !el.querySelector("img, [image-src]")) url = attrImageUrl(el);
+    if (!url) {
+      // No background yet. A lazy-bg plugin (WP-Rocket) applies the
+      // background-image AFTER this one-shot intersection check and flips its
+      // data-rocket-lazy-bg-* attr to "loaded". Watch this element's attributes
+      // so we re-check once the real background lands, instead of discarding it
+      // and leaving it permanently revealed.
+      if (!el.__mastirBgWatched) {
+        el.__mastirBgWatched = true;
+        bgSwapObserver.observe(el, { attributes: true });
+      }
+      return false;
+    }
+    if (/\.(svg|gif)(\?|$)/i.test(url)) return true;
+    // Custom elements that render their image in shadow DOM can't be
+    // repainted via a host background — flag them for an overlay.
+    if (!match) el.__mastirOverlayPaint = true;
+    blurElement(el);
+    enqueueImage(el);
+    return true;
+  }
+
+  // Re-check an element whose background arrived after its intersection check.
+  // Debounced on settle (lazy-bg plugins flip several attrs in a burst).
+  const bgSettleTimers = new WeakMap();
+  const bgSwapObserver = new MutationObserver((mutations) => {
+    profile("obs.bgSwap", () => {
+      for (const m of mutations) {
+        if (m.type !== "attributes") continue;
+        const el = m.target;
+        clearTimeout(bgSettleTimers.get(el));
+        bgSettleTimers.set(el, setTimeout(() => {
+          bgSettleTimers.delete(el);
+          // Idempotent: handleBgElement early-returns once processed/cached, so
+          // leaving the observer attached (like urlSwapObserver) is harmless.
+          handleBgElement(el);
+        }, SWAP_SETTLE_MS));
+      }
+    });
+  });
 
   const visibilityObserver = new IntersectionObserver((entries) => {
     profile("obs.intersection", () => {
@@ -1072,24 +1188,7 @@
       } else if (el.tagName === "VIDEO" && el.getAttribute("poster")) {
         enqueueImage(el);
       } else {
-        if (el.offsetWidth < 48 || el.offsetHeight < 48) continue;
-        const bg = getComputedStyle(el).backgroundImage;
-        const match = bg && bg !== "none" ? bg.match(/url\(["']?([^"')]+)["']?\)/) : null;
-        let url = match ? match[1] : null;
-        // Only fall back to an attribute-stored URL (data-png, landscape-src,
-        // etc.) when the element ISN'T just a container around a real <img>.
-        // Grid cells like flaticon's <li data-png="…512/….png"> hold the icon
-        // URL in an attribute but render it via a child <img> that we already
-        // segment — treating the <li> as an image too paints a cover-sized
-        // overlay over the whole cell and blows the layout up.
-        if (!url && !el.querySelector("img, [image-src]")) url = attrImageUrl(el);
-        if (!url) continue;
-        if (/\.(svg|gif)(\?|$)/i.test(url)) continue;
-        // Custom elements that render their image in shadow DOM can't be
-        // repainted via a host background — flag them for an overlay.
-        if (!match) el.__mastirOverlayPaint = true;
-        blurElement(el);
-        enqueueImage(el);
+        handleBgElement(el);
       }
     }
     });
@@ -1252,7 +1351,15 @@
   // asynchronously. If we happened to process the element while it still had the
   // placeholder, we segmented the wrong (tiny) image or bailed — this re-runs
   // segmentation once the real URL lands, closing that timing race.
-  const lastSwapUrl = new WeakMap();
+  //
+  // React on SETTLE, not on every write. Lazy-load plugins (Instagram Feed)
+  // churn src rapidly — real webp -> placeholder.png -> webp — within a few ms.
+  // Segmenting mid-churn processes a transient URL (the placeholder: no person,
+  // reveals) and the guards can't tell it from real content. So debounce per
+  // element and only act once writes go quiet, reading what's ACTUALLY
+  // displayed then. Pre-blur means nothing is revealed during the settle window.
+  const swapSettleTimers = new WeakMap();
+  const SWAP_SETTLE_MS = 150;
   const urlSwapObserver = new MutationObserver((mutations) => {
     if (selfUpdating) return;
     profile("obs.urlSwap", () => {
@@ -1260,24 +1367,29 @@
         if (m.type !== "attributes") continue;
         const img = m.target;
         if (img.__mastirOverlayPaint) continue;
-        const url = getImageUrl(img);
-        if (!url || url.startsWith("data:")) continue;
-        if (lastSwapUrl.get(img) === url) continue;
-        lastSwapUrl.set(img, url);
-        if (segMaskCache.has(img) && segFetchUrl.get(img) === url) continue;
-        if (MASTIR_PROFILE) {
-          const prev = segFetchUrl.get(img) || "";
-          mlog(`[mastir:urlSwap] WIPE hadCache=${segMaskCache.has(img)} prev=${prev.slice(0, 50)} new=${url.slice(0, 50)}`);
-        }
-        segProcessed.delete(img);
-        segMaskCache.delete(img);
-        enqueueImage(img);
+        clearTimeout(swapSettleTimers.get(img));
+        swapSettleTimers.set(img, setTimeout(() => {
+          swapSettleTimers.delete(img);
+          const url = getImageUrl(img);
+          if (!url || url.startsWith("data:")) return;
+          // Dedup on what we SEGMENTED (segFetchUrl). sameUrl() so a relative
+          // src and its absolute currentSrc for the same image compare equal.
+          // Once settled, url is the displayed image — if it matches, our mask
+          // is already correct (the churn returned to it) and we do nothing.
+          if (segMaskCache.has(img) && sameUrl(segFetchUrl.get(img), url)) return;
+          if (MASTIR_PROFILE) {
+            const prev = segFetchUrl.get(img) || "";
+            mlog(`[mastir:urlSwap] WIPE hadCache=${segMaskCache.has(img)} prev=${prev.slice(0, 50)} new=${url.slice(0, 50)}`);
+          }
+          segProcessed.delete(img);
+          segMaskCache.delete(img);
+          enqueueImage(img);
+        }, SWAP_SETTLE_MS));
       }
     });
   });
 
   function observeUrlSwap(img) {
-    lastSwapUrl.set(img, getImageUrl(img) || "");
     urlSwapObserver.observe(img, { attributes: true, attributeFilter: ["src", "srcset"] });
   }
 
