@@ -122,6 +122,8 @@
 
   // Pre-blur, observe, and recurse into any shadow root on a single element.
   function handleElement(el) {
+    // Our own concealment overlay is an <img> — never blur or segment it.
+    if (el.__mastirIsOverlay) return;
     if (el.tagName === "VIDEO") watchVideoPlayback(el);
     if (shouldPreBlur(el)) blurElement(el);
     observeElement(el);
@@ -651,15 +653,31 @@
 
   const IMG_URL_ATTR_RE = /\.(jpe?g|png|webp|avif|bmp)(\?|$)/i;
 
-  // Find an image URL stored in any attribute (custom elements like
-  // <adbl-full-bleed-image landscape-src="…"> hold their src off-spec).
+  // Find the best image URL stored in any attribute. Covers two off-spec cases
+  // with one generic scan, no attribute-name allowlist:
+  //  - custom elements holding a src off-spec (<adbl-full-bleed-image
+  //    landscape-src="…">), and
+  //  - lazy-load plugins (WP LazyLoad, WP-Rocket, UAGB) parking the real image
+  //    in data-lazy-src / data-lazy-srcset / data-src / etc. while src shows a
+  //    transparent placeholder.
+  // Each attribute value is parsed as a srcset-style list (a bare URL is just a
+  // one-candidate list), so the LARGEST variant wins — segmenting a small
+  // thumbnail yields a coarse blob mask. URLs are resolved to absolute, since
+  // lazy attributes are frequently relative.
   function attrImageUrl(el) {
+    let best = null;
     for (const attr of el.attributes) {
-      const v = attr.value;
-      if (!v || v.includes(" ")) continue;
-      if (/^(https?:|blob:)/.test(v) && IMG_URL_ATTR_RE.test(v)) return v;
+      if (!attr.value) continue;
+      for (const cand of attr.value.split(",")) {
+        const [url, d] = cand.trim().split(/\s+/);
+        if (!url || url.startsWith("data:") || !IMG_URL_ATTR_RE.test(url)) continue;
+        const w = parseFloat(d) || 0;
+        if (!best || w > best.w) best = { url, w };
+      }
     }
-    return null;
+    if (!best) return null;
+    try { return new URL(best.url, location.href).href; }
+    catch (e) { return null; }
   }
 
   // Compare two image URLs by their resolved absolute form, so a relative src
@@ -705,24 +723,11 @@
       const match = bg.match(/url\(["']?([^"')]+)["']?\)/);
       if (match) return match[1];
     }
+    // Generic scan of every attribute for an image URL — covers custom-element
+    // src attributes AND lazy-load plugins (data-lazy-src/-srcset, data-src),
+    // picking the largest srcset variant and resolving relative URLs.
     const attrUrl = attrImageUrl(el);
     if (attrUrl) return attrUrl;
-    // Lazy-load plugins (WP LazyLoad, WP-Rocket, UAGB) keep the real image in
-    // data-lazy-src / data-src (or the srcset equivalents) while src shows a
-    // transparent data: placeholder. These URLs are often RELATIVE, which
-    // attrImageUrl rejects — resolve them to absolute so the first pass segments
-    // the real image instead of the placeholder (which reveals, having no person).
-    const lazySrc = el.getAttribute("data-lazy-src") || el.getAttribute("data-src");
-    if (isReal(lazySrc)) return new URL(lazySrc, location.href).href;
-    const lazySrcset = el.getAttribute("data-lazy-srcset") || el.getAttribute("data-srcset");
-    if (lazySrcset) {
-      const best = lazySrcset.split(",")
-        .map((c) => c.trim())
-        .map((c) => { const [url, d] = c.split(/\s+/); return { url, w: parseFloat(d) || 0 }; })
-        .filter((c) => c.url && !c.url.startsWith("data:"))
-        .sort((a, b) => b.w - a.w)[0];
-      if (best) return new URL(best.url, location.href).href;
-    }
     // Last resort: a data:-URI placeholder is still a real, viewable image —
     // segment its pixels rather than skipping the element entirely.
     return el.currentSrc || el.src || null;
@@ -972,21 +977,49 @@
       wrapper.appendChild(el);
       el.__mastirOverlayWrapper = wrapper;
 
-      overlay = document.createElement("div");
-      Object.assign(overlay.style, {
+      // Use an <img>, not a div background-image: background-images get a fast
+      // low-quality scale on first paint and a deferred high-quality re-raster,
+      // which reads as a colored-but-blurry mask that snaps sharp a beat later.
+      // An <img> uses the normal decode+scale path (same as in-place painting,
+      // which never flashes), so the overlay lands sharp.
+      overlay = document.createElement("img");
+      overlay.__mastirIsOverlay = true; // exclude from our own scan/pre-blur
+      // Set every layout-critical prop with !important: page/theme `img {...!important}`
+      // rules match our overlay too and would otherwise override position/size, dropping
+      // it into normal flow (rendered below the real image instead of over it).
+      const s = {
         position: "absolute", top: "0", left: "0", width: "100%", height: "100%",
-        pointerEvents: "none", backgroundSize: "cover", backgroundPosition: "center", zIndex: "1",
-      });
+        "pointer-events": "none", "object-fit": "cover", "object-position": "center",
+        "z-index": "1", filter: "none",
+      };
+      for (const [k, v] of Object.entries(s)) overlay.style.setProperty(k, v, "important");
       el.__mastirOverlay = overlay;
       wrapper.appendChild(overlay);
     }
-    overlay.style.setProperty("background-image", `url(${dataUrl})`, "important");
+    overlay.src = dataUrl;
   }
 
   function applyMask(img) {
     const cached = segMaskCache.get(img);
     if (!cached || !cached.originalPixels) return;
     const { originalPixels, maskAlpha, w, h } = cached;
+    // DIAGNOSTIC: count how many times applyMask paints each element and with
+    // what mask coverage. Two paints with different coverage => double-segment
+    // (coarse then refined). One paint => the blob is final / cause is elsewhere.
+    if (MASTIR_PROFILE) {
+      let personPx = 0;
+      for (let i = 0; i < maskAlpha.length; i++) if (maskAlpha[i] > 0) personPx++;
+      img.__mastirPaintN = (img.__mastirPaintN || 0) + 1;
+      const cov = maskAlpha.length ? ((personPx / maskAlpha.length) * 100).toFixed(1) : "0";
+      mlog(`[mastir:paint] #${img.__mastirPaintN} ${img.tagName} seg=${w}x${h} nat=${img.naturalWidth}x${img.naturalHeight} disp=${img.offsetWidth}x${img.offsetHeight} coverage=${cov}% url=${(segFetchUrl.get(img) || "").slice(0, 70)}`);
+      // DIAGNOSTIC: dump nesting + sibling-image state to catch the layer race
+      // (sharp color image under a gray blob = two nested elements settling out
+      // of order). Logged to buffer; read after load with mastirLog("nest").
+      const anc = img.closest("a") || img.parentElement;
+      const kids = anc ? [...anc.querySelectorAll("img")].map((i) =>
+        `${i.tagName}[filter=${i.style.filter ? "SET" : "none"} ov=${!!i.__mastirOverlay} paintN=${i.__mastirPaintN || 0}]`).join(" ") : "";
+      mlog(`[mastir:nest] ${img.tagName} in <${anc ? anc.tagName : "?"}> ancBg=${anc ? /url\(/.test(getComputedStyle(anc).backgroundImage) : "?"} kids: ${kids}`);
+    }
     const pixels = originalPixels.slice();
     const didPaint = profile("paint.blend", () => {
       let rSum = 0, gSum = 0, bSum = 0, count = 0;
@@ -1018,6 +1051,12 @@
       return true;
     });
     cached.hasPerson = didPaint;
+    // The poster-decision filter (global blur/grayscale pref, "none" at
+    // defaults). For a video, only a pristine poster (never played, still at
+    // frame 0) may be revealed — once it has played, it's latched to MAX_BLUR,
+    // because playback frames past the poster are never segmented.
+    const finalFilter = (img.tagName === "VIDEO" && (img.__mastirPlayed || !img.paused || img.currentTime > 0))
+      ? MAX_BLUR : buildFilter(!blurOff);
     if (didPaint) {
       const dataUrl = profile("paint.toDataURL", () => {
         const canvas = document.createElement("canvas");
@@ -1039,48 +1078,68 @@
         img.hasAttribute("data-lazy-srcset") || img.hasAttribute("data-srcset") ||
         displayed.startsWith("data:");
       if (pageOwnsSrc) img.__mastirOverlayPaint = true;
-      if ((img.tagName === "IMG" && isDirectImageView) || img.__mastirOverlayPaint) {
-        paintOverlay(img, dataUrl);
-      } else if (img.tagName === "IMG") {
-        selfUpdating = true;
-        const picture = img.closest("picture");
-        if (picture) picture.querySelectorAll("source").forEach((s) => s.remove());
-        img.removeAttribute("srcset");
-        img.src = dataUrl;
-        img.__mastirPaintedSrc = dataUrl;
-        selfUpdating = false;
-      } else if (img.tagName === "VIDEO") {
-        img.setAttribute("poster", dataUrl);
-      } else {
-        // Background may layer gradients over the image url(); swap only the
-        // url() so any decorative gradient tint is preserved.
-        const origBg = getComputedStyle(img).backgroundImage;
-        if (origBg && /url\(/.test(origBg) && /gradient/.test(origBg)) {
-          const newBg = origBg.replace(/url\(["']?[^"')]+["']?\)/, `url(${dataUrl})`);
-          img.style.setProperty("background-image", newBg, "important");
+      // Decode the concealed PNG off-screen BEFORE swapping it in and lifting
+      // the blur. Otherwise the filter clears synchronously while the OLD real
+      // pixels are still on screen (src/background decode async) — a brief
+      // sharp reveal, worst on large images that decode slowest. Swapping and
+      // un-blurring only after decode makes the reveal atomic.
+      const t0 = performance.now();
+      if (MASTIR_PROFILE) mlog(`[mastir:trace] t=${t0.toFixed(0)} decode-start filter=${img.style.filter || "none"} ov=${!!img.__mastirOverlay} ovPaint=${!!img.__mastirOverlayPaint}`);
+      const swap = () => {
+        if (MASTIR_PROFILE) mlog(`[mastir:trace] t=${performance.now().toFixed(0)} swap-enter (+${(performance.now() - t0).toFixed(0)}ms) filter=${img.style.filter || "none"} ov=${!!img.__mastirOverlay}`);
+        if ((img.tagName === "IMG" && isDirectImageView) || img.__mastirOverlayPaint) {
+          paintOverlay(img, dataUrl);
+        } else if (img.tagName === "IMG") {
+          selfUpdating = true;
+          const picture = img.closest("picture");
+          if (picture) picture.querySelectorAll("source").forEach((s) => s.remove());
+          img.removeAttribute("srcset");
+          img.src = dataUrl;
+          img.__mastirPaintedSrc = dataUrl;
+          selfUpdating = false;
+        } else if (img.tagName === "VIDEO") {
+          img.setAttribute("poster", dataUrl);
         } else {
-          img.style.setProperty("background-image", `url(${dataUrl})`, "important");
+          // Background may layer gradients over the image url(); swap only the
+          // url() so any decorative gradient tint is preserved.
+          const origBg = getComputedStyle(img).backgroundImage;
+          if (origBg && /url\(/.test(origBg) && /gradient/.test(origBg)) {
+            const newBg = origBg.replace(/url\(["']?[^"')]+["']?\)/, `url(${dataUrl})`);
+            img.style.setProperty("background-image", newBg, "important");
+          } else {
+            img.style.setProperty("background-image", `url(${dataUrl})`, "important");
+          }
         }
-      }
-    } else if (img.tagName === "IMG" && img.src !== segOriginalSrc.get(img) &&
-               segOriginalSrc.has(img) && !segOriginalSrc.get(img).startsWith("blob:")) {
-      // No person found: restore the original src ONLY if we actually changed
-      // it and the original is still valid. Never rewrite to a blob: URL — the
-      // page may have revoked it (e.g. Tableau tiles), which would blank the
-      // image. In the normal no-person flow src was never touched, so this is
-      // usually a no-op.
-      selfUpdating = true;
-      img.src = segOriginalSrc.get(img);
-      selfUpdating = false;
-    }
-    // Apply the poster-decision filter (global blur/grayscale pref, "none" at
-    // defaults). For a video, only a pristine poster (never played, still at
-    // frame 0) may be revealed — once it has played, it's latched to MAX_BLUR,
-    // because playback frames past the poster are never segmented.
-    if (img.tagName === "VIDEO" && (img.__mastirPlayed || !img.paused || img.currentTime > 0)) {
-      img.style.setProperty("filter", MAX_BLUR, "important");
+        img.style.setProperty("filter", finalFilter, "important");
+        if (MASTIR_PROFILE) {
+          const ov = img.__mastirOverlay;
+          const geom = ov ? `ovBox=${ov.offsetWidth}x${ov.offsetHeight}` : "no-ov";
+          mlog(`[mastir:trace] t=${performance.now().toFixed(0)} swap-done png=${w}x${h} ${geom} filter-set-to=${finalFilter || "none"} ovSrc=${ov ? !!ov.src : "n/a"}`);
+          // Re-sample the overlay box a few frames later: if the box grows after
+          // swap (img still loading/reflowing underneath), the `cover` background
+          // gets upscaled from the moment-of-paint size = colored blurry→sharp.
+          [100, 400, 800].forEach((dt) => setTimeout(() => {
+            if (!ov) return;
+            mlog(`[mastir:trace] t=${performance.now().toFixed(0)} resample(+${dt}) png=${w}x${h} ovBox=${ov.offsetWidth}x${ov.offsetHeight} imgNat=${img.naturalWidth}x${img.naturalHeight}`);
+          }, dt));
+        }
+      };
+      const decoder = new Image();
+      decoder.onload = decoder.onerror = swap;
+      decoder.src = dataUrl;
     } else {
-      img.style.setProperty("filter", buildFilter(!blurOff), "important");
+      if (img.tagName === "IMG" && img.src !== segOriginalSrc.get(img) &&
+          segOriginalSrc.has(img) && !segOriginalSrc.get(img).startsWith("blob:")) {
+        // No person found: restore the original src ONLY if we actually changed
+        // it and the original is still valid. Never rewrite to a blob: URL — the
+        // page may have revoked it (e.g. Tableau tiles), which would blank the
+        // image. In the normal no-person flow src was never touched, so this is
+        // usually a no-op.
+        selfUpdating = true;
+        img.src = segOriginalSrc.get(img);
+        selfUpdating = false;
+      }
+      img.style.setProperty("filter", finalFilter, "important");
     }
     // Observe src changes on every segmented image, not just painted ones —
     // a revealed (no-person) thumbnail can later have its src swapped to new
@@ -1129,6 +1188,7 @@
   }
 
   function enqueueImage(img) {
+    if (img.__mastirIsOverlay) return; // our own concealment overlay, never segment it
     if (segMaskCache.has(img) || segQueue.includes(img) || segProcessed.has(img)) return;
     if (img.tagName === "IMG" && isAnimatedImageUrl(getImageUrl(img))) {
       segProcessed.add(img);
@@ -1195,6 +1255,26 @@
       for (const m of mutations) {
         if (m.type !== "attributes") continue;
         const el = m.target;
+        if (segProcessed.has(el) || segMaskCache.has(el)) continue;
+        // Blur IMMEDIATELY once a background image actually appears, before the
+        // settle debounce. The element wasn't pre-blurred (it had no inline
+        // background at discovery), so a lazy-bg plugin injecting the real image
+        // would otherwise show it unconcealed for the whole SWAP_SETTLE_MS
+        // window. Two guards:
+        //  - a URL must be present: these watched elements are often plain
+        //    layout containers (even <body>, which AOS mutates on scroll), and
+        //    blurring one with no image blurs all its descendants (whole page).
+        //  - blur AT MOST ONCE: blurElement writes el.style, itself an attribute
+        //    mutation that re-fires this observer — an unguarded blur would loop
+        //    and keep clearing the settle timer so handleBgElement never runs.
+        //    handleBgElement/applyMask takes over the filter after settle.
+        if (!el.__mastirBgBlurred) {
+          const bg = getComputedStyle(el).backgroundImage;
+          if (bg && bg !== "none" && /url\(/.test(bg)) {
+            el.__mastirBgBlurred = true;
+            blurElement(el);
+          }
+        }
         clearTimeout(bgSettleTimers.get(el));
         bgSettleTimers.set(el, setTimeout(() => {
           bgSettleTimers.delete(el);
