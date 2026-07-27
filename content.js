@@ -115,7 +115,11 @@
 
   function blurElement(el) {
     el.style.setProperty("filter", MAX_BLUR, "important");
-    el.style.clipPath = "inset(0)";
+    // Don't set clip-path on an SVG <image>: inline style overrides its
+    // clip-path="url(#…)" attribute, replacing the element's real (often
+    // non-rectangular) clip with a rectangle. inset(0) only exists to contain
+    // blur bleed, which the element's own clip already does.
+    if (!(el instanceof SVGImageElement)) el.style.clipPath = "inset(0)";
   }
 
   const isDirectImageView = document.contentType?.startsWith("image/");
@@ -959,6 +963,27 @@
   function paintOverlay(el, dataUrl) {
     let overlay = el.__mastirOverlay;
     if (!overlay) {
+      // An SVG <image> lives in the SVG coordinate model, not HTML flow: an HTML
+      // wrapper/overlay can't participate in its viewBox mapping or clip-path and
+      // just breaks the element's layout. Overlay it the SVG-native way instead —
+      // append a sibling <image> in the same coordinate space, reusing the
+      // original's geometry and clip-path so the mask lands pixel-aligned and
+      // identically clipped. Later siblings paint on top in document order, so no
+      // z-index is needed.
+      if (el instanceof SVGImageElement) {
+        const parent = el.parentNode;
+        if (!parent) return;
+        overlay = document.createElementNS("http://www.w3.org/2000/svg", "image");
+        overlay.__mastirIsOverlay = true; // exclude from our own scan/pre-blur
+        for (const attr of ["x", "y", "width", "height", "preserveAspectRatio", "clip-path"]) {
+          const v = el.getAttribute(attr);
+          if (v != null) overlay.setAttribute(attr, v);
+        }
+        el.__mastirOverlay = overlay;
+        parent.insertBefore(overlay, el.nextSibling);
+        overlay.setAttribute("href", dataUrl);
+        return;
+      }
       const parent = el.parentElement;
       if (!parent) return;
       // Wrap el in a tight, position:relative container that shrink-wraps it.
@@ -996,7 +1021,8 @@
       el.__mastirOverlay = overlay;
       wrapper.appendChild(overlay);
     }
-    overlay.src = dataUrl;
+    if (overlay instanceof SVGImageElement) overlay.setAttribute("href", dataUrl);
+    else overlay.src = dataUrl;
   }
 
   function applyMask(img) {
@@ -1011,14 +1037,7 @@
       for (let i = 0; i < maskAlpha.length; i++) if (maskAlpha[i] > 0) personPx++;
       img.__mastirPaintN = (img.__mastirPaintN || 0) + 1;
       const cov = maskAlpha.length ? ((personPx / maskAlpha.length) * 100).toFixed(1) : "0";
-      mlog(`[mastir:paint] #${img.__mastirPaintN} ${img.tagName} seg=${w}x${h} nat=${img.naturalWidth}x${img.naturalHeight} disp=${img.offsetWidth}x${img.offsetHeight} coverage=${cov}% url=${(segFetchUrl.get(img) || "").slice(0, 70)}`);
-      // DIAGNOSTIC: dump nesting + sibling-image state to catch the layer race
-      // (sharp color image under a gray blob = two nested elements settling out
-      // of order). Logged to buffer; read after load with mastirLog("nest").
-      const anc = img.closest("a") || img.parentElement;
-      const kids = anc ? [...anc.querySelectorAll("img")].map((i) =>
-        `${i.tagName}[filter=${i.style.filter ? "SET" : "none"} ov=${!!i.__mastirOverlay} paintN=${i.__mastirPaintN || 0}]`).join(" ") : "";
-      mlog(`[mastir:nest] ${img.tagName} in <${anc ? anc.tagName : "?"}> ancBg=${anc ? /url\(/.test(getComputedStyle(anc).backgroundImage) : "?"} kids: ${kids}`);
+      mlog(`[mastir:paint] #${img.__mastirPaintN} ${img.tagName} seg=${w}x${h} coverage=${cov}% url=${(segFetchUrl.get(img) || "").slice(0, 70)}`);
     }
     const pixels = originalPixels.slice();
     const didPaint = profile("paint.blend", () => {
@@ -1083,10 +1102,7 @@
       // pixels are still on screen (src/background decode async) — a brief
       // sharp reveal, worst on large images that decode slowest. Swapping and
       // un-blurring only after decode makes the reveal atomic.
-      const t0 = performance.now();
-      if (MASTIR_PROFILE) mlog(`[mastir:trace] t=${t0.toFixed(0)} decode-start filter=${img.style.filter || "none"} ov=${!!img.__mastirOverlay} ovPaint=${!!img.__mastirOverlayPaint}`);
       const swap = () => {
-        if (MASTIR_PROFILE) mlog(`[mastir:trace] t=${performance.now().toFixed(0)} swap-enter (+${(performance.now() - t0).toFixed(0)}ms) filter=${img.style.filter || "none"} ov=${!!img.__mastirOverlay}`);
         if ((img.tagName === "IMG" && isDirectImageView) || img.__mastirOverlayPaint) {
           paintOverlay(img, dataUrl);
         } else if (img.tagName === "IMG") {
@@ -1111,18 +1127,6 @@
           }
         }
         img.style.setProperty("filter", finalFilter, "important");
-        if (MASTIR_PROFILE) {
-          const ov = img.__mastirOverlay;
-          const geom = ov ? `ovBox=${ov.offsetWidth}x${ov.offsetHeight}` : "no-ov";
-          mlog(`[mastir:trace] t=${performance.now().toFixed(0)} swap-done png=${w}x${h} ${geom} filter-set-to=${finalFilter || "none"} ovSrc=${ov ? !!ov.src : "n/a"}`);
-          // Re-sample the overlay box a few frames later: if the box grows after
-          // swap (img still loading/reflowing underneath), the `cover` background
-          // gets upscaled from the moment-of-paint size = colored blurry→sharp.
-          [100, 400, 800].forEach((dt) => setTimeout(() => {
-            if (!ov) return;
-            mlog(`[mastir:trace] t=${performance.now().toFixed(0)} resample(+${dt}) png=${w}x${h} ovBox=${ov.offsetWidth}x${ov.offsetHeight} imgNat=${img.naturalWidth}x${img.naturalHeight}`);
-          }, dt));
-        }
       };
       const decoder = new Image();
       decoder.onload = decoder.onerror = swap;
@@ -1225,7 +1229,7 @@
     // URL in an attribute but render it via a child <img> that we already
     // segment — treating the <li> as an image too paints a cover-sized
     // overlay over the whole cell and blows the layout up.
-    if (!url && !el.querySelector("img, [image-src]")) url = attrImageUrl(el);
+    if (!url && !el.querySelector("img, image, [image-src]")) url = attrImageUrl(el);
     if (!url) {
       // No background yet. A lazy-bg plugin (WP-Rocket) applies the
       // background-image AFTER this one-shot intersection check and flips its
