@@ -953,13 +953,24 @@
   // elements, churning images). All styling via CSSOM (setProperty), which
   // CSP style-src does not govern — so this works under strict CSP too.
   //
-  // The overlay is a 100%x100% absolutely-positioned child of a wrapper that
-  // shrink-wraps the ELEMENT (not its parent). This matters: putting the
-  // overlay in el.parentElement and forcing that parent position:relative sizes
-  // the overlay to the parent's box, which can be far larger than the image
-  // (e.g. a grid cell wrapping a small icon) and blow the layout up. A tight
-  // wrapper makes 100% == the element's own box, and because it's ordinary flow
-  // layout it tracks the element through scroll/resize/reflow with no JS.
+  // The overlay is inserted as a SIBLING of the element and absolutely
+  // positioned to the element's own box (offsetLeft/Top/Width/Height), with the
+  // element's existing parent made position:relative to serve as the containing
+  // block. We deliberately do NOT wrap/reparent the element: a wrapper changes
+  // the element's position in the DOM tree, which breaks any structural CSS the
+  // page uses to size it (`.container > img`, flex/grid child participation,
+  // :first-child, …) and blows its layout up. Sizing to the element's own box
+  // (not the parent's) keeps a small icon in a large grid cell from ballooning,
+  // and handles a grid of images sharing one parent — each overlay lands on its
+  // own image's sub-rectangle. A ResizeObserver re-syncs on reflow, since
+  // absolute positioning (unlike flow) doesn't track the element automatically.
+  function syncOverlay(el, overlay) {
+    overlay.style.setProperty("left", `${el.offsetLeft}px`, "important");
+    overlay.style.setProperty("top", `${el.offsetTop}px`, "important");
+    overlay.style.setProperty("width", `${el.offsetWidth}px`, "important");
+    overlay.style.setProperty("height", `${el.offsetHeight}px`, "important");
+  }
+
   function paintOverlay(el, dataUrl) {
     let overlay = el.__mastirOverlay;
     if (!overlay) {
@@ -986,21 +997,15 @@
       }
       const parent = el.parentElement;
       if (!parent) return;
-      // Wrap el in a tight, position:relative container that shrink-wraps it.
-      const wrapper = document.createElement("span");
       const cs = getComputedStyle(el);
-      const ws = wrapper.style;
-      ws.setProperty("position", "relative", "important");
-      // Match the element's display box so wrapping doesn't reflow the page:
-      // inline-level images -> inline-block (shrink-wrap); block -> block.
-      ws.setProperty("display", cs.display === "block" || cs.display === "flex" || cs.display === "grid" ? "block" : "inline-block", "important");
-      ws.setProperty("padding", "0", "important");
-      ws.setProperty("margin", "0", "important");
-      ws.setProperty("border", "0", "important");
-      ws.setProperty("max-width", "100%", "important");
-      parent.insertBefore(wrapper, el);
-      wrapper.appendChild(el);
-      el.__mastirOverlayWrapper = wrapper;
+      // The overlay's containing block must be a positioned ancestor. Promote the
+      // element's existing parent to position:relative if it's static — without
+      // reparenting the element, so the page's structural sizing CSS keeps
+      // matching. (If already positioned, leave it: offsetLeft/Top are relative
+      // to it either way.)
+      if (getComputedStyle(parent).position === "static") {
+        parent.style.setProperty("position", "relative", "important");
+      }
 
       // Use an <img>, not a div background-image: background-images get a fast
       // low-quality scale on first paint and a deferred high-quality re-raster,
@@ -1010,16 +1015,22 @@
       overlay = document.createElement("img");
       overlay.__mastirIsOverlay = true; // exclude from our own scan/pre-blur
       // Set every layout-critical prop with !important: page/theme `img {...!important}`
-      // rules match our overlay too and would otherwise override position/size, dropping
-      // it into normal flow (rendered below the real image instead of over it).
+      // rules match our overlay too and would otherwise override position/size.
+      // Inherit object-fit/position from the element so contain-vs-cover matches
+      // and the mask aligns with how the page actually renders the image.
       const s = {
-        position: "absolute", top: "0", left: "0", width: "100%", height: "100%",
-        "pointer-events": "none", "object-fit": "cover", "object-position": "center",
+        position: "absolute",
+        "pointer-events": "none",
+        "object-fit": cs.objectFit, "object-position": cs.objectPosition,
         "z-index": "1", filter: "none",
       };
       for (const [k, v] of Object.entries(s)) overlay.style.setProperty(k, v, "important");
+      syncOverlay(el, overlay);
       el.__mastirOverlay = overlay;
-      wrapper.appendChild(overlay);
+      // Re-sync the overlay to the element's box whenever it reflows (responsive
+      // breakpoints, window resize). Absolute positioning doesn't track flow.
+      new ResizeObserver(() => syncOverlay(el, overlay)).observe(el);
+      parent.insertBefore(overlay, el.nextSibling);
     }
     if (overlay instanceof SVGImageElement) overlay.setAttribute("href", dataUrl);
     else overlay.src = dataUrl;
