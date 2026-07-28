@@ -907,7 +907,7 @@
       // Unreadable-by-script: give up immediately and KEEP the pre-blur — never
       // reveal an image we couldn't inspect. HTTP 4xx (404/403/410) are dead or
       // forbidden URLs; CORS/decode failures won't change on retry either.
-      if (/CORS|blocked|decode failed|blob load failed|HTTP 4\d\d/i.test(e.message)) {
+      if (/CORS|blocked|decode failed|blob load failed|HTTP 4\d\d|context invalidated/i.test(e.message)) {
         markDone(img, true, "unreadable:" + e.message.slice(0, 30));
       } else if (/SVG|natural dimensions|createImageBitmap|Assertion/i.test(e.message)) {
         // Benign non-images (SVG/GIF/undecodable vector) — safe to reveal.
