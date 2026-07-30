@@ -1036,6 +1036,25 @@
     else overlay.src = dataUrl;
   }
 
+  // Background-image equivalent of srcObserver. Responsive-background scripts
+  // (e.g. Drupal's .responsiveBackground, which tracks its own data-current-src)
+  // rewrite the element's inline background-image on load/resize, clobbering the
+  // mask we painted there — and because they assign el.style.backgroundImage
+  // directly, our !important is dropped with it. Re-paint whenever the url()
+  // stops being ours. Our own repaint re-fires this observer, but then the url()
+  // IS ours again, so it short-circuits instead of looping.
+  const bgReapplyObserver = new MutationObserver((mutations) => {
+    profile("obs.bgReapply", () => {
+      for (const m of mutations) {
+        const el = m.target;
+        const painted = el.__mastirPaintedBg;
+        if (!painted) continue;
+        if ((el.style.backgroundImage || "").includes(painted)) continue; // still ours
+        applyMask(el);
+      }
+    });
+  });
+
   function applyMask(img) {
     const cached = segMaskCache.get(img);
     if (!cached || !cached.originalPixels) return;
@@ -1136,6 +1155,8 @@
           } else {
             img.style.setProperty("background-image", `url(${dataUrl})`, "important");
           }
+          img.__mastirPaintedBg = dataUrl;
+          bgReapplyObserver.observe(img, { attributes: true, attributeFilter: ["style"] });
         }
         img.style.setProperty("filter", finalFilter, "important");
       };
