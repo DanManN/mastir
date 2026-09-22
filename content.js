@@ -109,7 +109,12 @@
     if (el.tagName === "IMG") return true;
     if (el.hasAttribute("image-src")) return true;
     const style = el.getAttribute("style");
-    if (style && BG_IMG_RE.test(style)) return true;
+    const bg = style && style.match(BG_IMG_RE);
+    // A very short data: URI is a spacer/placeholder, not content — Gmail's
+    // search input uses a 1x1 transparent GIF as its background. Blurring one
+    // blurs the element itself, and since it's never segmented (nothing lifts
+    // the filter) the blur is permanent. Any real embedded image is far longer.
+    if (bg && !(bg[1].startsWith("data:") && bg[1].length < 256)) return true;
     return false;
   }
 
