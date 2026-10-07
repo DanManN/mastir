@@ -643,7 +643,7 @@
       const resp = await profileAsync("seg.roundtrip", () => bridgeRequest("mastir-segment", payload, 20000));
       if (resp.error) throw new Error(resp.error);
       const raw = profile("seg.decode", () => resp.rawB64 ? base64ToBytes(resp.rawB64) : null);
-      return { raw, sw: resp.w, sh: resp.h };
+      return { raw, sw: resp.w, sh: resp.h, model: resp.model };
     };
     // Fast path: for http(s) URLs, let the offscreen doc fetch full-res itself
     // (sharper mask, no bridge transfer). If that fails — e.g. the offscreen's
@@ -876,12 +876,12 @@
 
       const bitmap = await acquireBitmap(fetchUrl, img);
 
-      const { raw, sw, sh } = await segment(fetchUrl, bitmap);
+      const { raw, sw, sh, model } = await segment(fetchUrl, bitmap);
       const w = bitmap.width, h = bitmap.height;
       if (MASTIR_PROFILE) {
         let personPx = 0;
         if (raw) for (let i = 0; i < raw.length; i++) if (raw[i] > 0) personPx++;
-        mlog(`[mastir] seg  bitmap=${w}x${h}  mask=${sw}x${sh}  person=${personPx}/${raw ? raw.length : 0}  ${fetchUrl.slice(0, 90)}`);
+        mlog(`[mastir] seg  bitmap=${w}x${h}  mask=${sw}x${sh}  model=${model}  person=${personPx}/${raw ? raw.length : 0}  ${fetchUrl.slice(0, 90)}`);
       }
       const canvas = document.createElement("canvas");
       canvas.width = w;
@@ -969,11 +969,29 @@
   // and handles a grid of images sharing one parent — each overlay lands on its
   // own image's sub-rectangle. A ResizeObserver re-syncs on reflow, since
   // absolute positioning (unlike flow) doesn't track the element automatically.
+  // Measure with client rects, not offsetLeft/offsetTop. Offsets are pure
+  // layout values that IGNORE transforms, so a theme that shifts an image with
+  // `transform: translate(...)` (BigCommerce's card-img-hover) leaves the
+  // overlay displaced by exactly that translation. Rects include transforms,
+  // and because the overlay shares the element's parent, a transform on that
+  // parent applies to both and cancels out of the difference. Offsets are still
+  // needed rather than relying on the static position: inside a flex/grid
+  // parent an auto-offset box collapses to the container's content origin, so
+  // every overlay in an image grid would stack in the same corner.
   function syncOverlay(el, overlay) {
-    overlay.style.setProperty("left", `${el.offsetLeft}px`, "important");
-    overlay.style.setProperty("top", `${el.offsetTop}px`, "important");
-    overlay.style.setProperty("width", `${el.offsetWidth}px`, "important");
-    overlay.style.setProperty("height", `${el.offsetHeight}px`, "important");
+    const parent = overlay.parentElement || el.parentElement;
+    if (!parent) return;
+    const er = el.getBoundingClientRect();
+    const pr = parent.getBoundingClientRect();
+    // Absolute offsets resolve against the containing block's PADDING box,
+    // while getBoundingClientRect returns the border box — drop the border.
+    const ps = getComputedStyle(parent);
+    const left = er.left - pr.left - (parseFloat(ps.borderLeftWidth) || 0);
+    const top = er.top - pr.top - (parseFloat(ps.borderTopWidth) || 0);
+    overlay.style.setProperty("left", `${left}px`, "important");
+    overlay.style.setProperty("top", `${top}px`, "important");
+    overlay.style.setProperty("width", `${er.width}px`, "important");
+    overlay.style.setProperty("height", `${er.height}px`, "important");
   }
 
   function paintOverlay(el, dataUrl) {

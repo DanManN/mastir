@@ -9,7 +9,7 @@
 const MAX_SEG_DIM = 256;
 
 // --- Model configuration ---------------------------------------------------
-// Swap the active model by changing ACTIVE_MODEL. Each entry describes its
+// Which models run, and in what order, is set by MODEL_CHAIN below. Each entry describes its
 // asset and how to interpret the category mask into "person" pixels:
 //   isPerson(category) -> true if that class index counts as a person.
 //
@@ -17,6 +17,11 @@ const MAX_SEG_DIM = 256;
 //   subject (hair/body-skin/face-skin/clothes/accessories). Selfie framing.
 // deeplabv3 (Pascal VOC): 21 classes, person == class 15. General semantic
 //   segmentation — whole clothed body, arbitrary framing, multiple people.
+// selfie_segmenter / _landscape: 2 classes, person == class 0 (inverted vs
+//   the other models), no skin/hair/clothes split — so person maps to 2 (skin)
+//   like deeplab, or Skin Only mode (threshold 2) would conceal nothing. The
+//   landscape variant has a 256x144 input tensor, so wide images squash to
+//   1.78:1, not 1:1.
 // selfie_multiclass_256x256 classes:
 //   0=background, 1=hair, 2=body-skin, 3=face-skin, 4=clothes, 5=accessories
 // Output mask labels (sent to content.js):
@@ -30,20 +35,37 @@ const MODELS = {
     asset: "deeplabv3.tflite",
     label: (c) => c === 15 ? 2 : 0,
   },
+  // These two invert the usual convention: class 0 is the PERSON, not the
+  // background. Mapping c>0 to person conceals the backdrop and leaves the
+  // subject visible.
+  selfieBinary: {
+    asset: "selfie_segmenter.tflite",
+    label: (c) => c === 0 ? 2 : 0,
+  },
+  landscape: {
+    asset: "selfie_segmenter_landscape.tflite",
+    label: (c) => c === 0 ? 2 : 0,
+  },
 };
-const ACTIVE_MODEL = "selfie";
+// Models to try, in order, until one finds a person. Each entry is a key of
+// MODELS above. Edit this list to change which models run and in what order;
+// a single-element list pins one model. Falling back only costs extra
+// inference when a model finds NOTHING — the case we'd otherwise lose — so
+// images that the first model handles pay nothing. Models load lazily, so
+// later entries cost no memory until something actually misses.
+const MODEL_CHAIN = ["selfie", "selfieBinary", "landscape"];
 
-let segmenter = null;
-let segLoading = null;
+const segmenters = new Map();  // name -> ImageSegmenter
+const segLoading = new Map();  // name -> in-flight load promise
 
-function loadSegmenter() {
-  if (segmenter) return Promise.resolve(segmenter);
-  if (segLoading) return segLoading;
-  segLoading = (async () => {
-    const model = MODELS[ACTIVE_MODEL];
+function loadSegmenter(name) {
+  if (segmenters.has(name)) return Promise.resolve(segmenters.get(name));
+  if (segLoading.has(name)) return segLoading.get(name);
+  const loading = (async () => {
+    const model = MODELS[name];
     const vision = await import(chrome.runtime.getURL("vision_bundle.mjs"));
     const wasmFiles = await vision.FilesetResolver.forVisionTasks(chrome.runtime.getURL("wasm"));
-    segmenter = await vision.ImageSegmenter.createFromOptions(wasmFiles, {
+    const seg = await vision.ImageSegmenter.createFromOptions(wasmFiles, {
       baseOptions: {
         modelAssetPath: chrome.runtime.getURL(model.asset),
         delegate: "GPU",
@@ -52,13 +74,15 @@ function loadSegmenter() {
       outputCategoryMask: true,
       outputConfidenceMasks: false,
     });
-    console.log(`[mastir/offscreen] segmenter ready (${ACTIVE_MODEL})`);
-    return segmenter;
+    segmenters.set(name, seg);
+    console.log(`[mastir/offscreen] segmenter ready (${name})`);
+    return seg;
   })().catch((e) => {
-    segLoading = null;
+    segLoading.delete(name);
     throw e;
   });
-  return segLoading;
+  segLoading.set(name, loading);
+  return loading;
 }
 
 function base64ToBytes(b64) {
@@ -96,17 +120,10 @@ function bytesToBase64(bytes) {
     return { bitmap: await createImageBitmap(imageData), sw: w, sh: h };
   }
 
-  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-    if (msg.type !== "mastir-segment-offscreen") return false;
-    (async () => {
-      const seg = await loadSegmenter();
-      const model = MODELS[ACTIVE_MODEL];
-      const label = model.label;
-      const { bitmap } = msg.url
-        ? await bitmapFromUrl(msg.url)
-        : await bitmapFromPixels(msg.pixelsB64, msg.w, msg.h);
+  // Run one model over the bitmap and return its person-mask, the mask dims,
+  // and how many person pixels it found (0 = this model saw nobody).
+  function runModel(seg, label, bitmap) {
       const result = seg.segment(bitmap);
-      bitmap.close();
       const mask = result.categoryMask;
       let raw = null;
       let mw = 0, mh = 0;
@@ -138,7 +155,36 @@ function bytesToBase64(bytes) {
         }
         result.close();
       }
-      sendResponse({ rawB64: raw ? bytesToBase64(raw) : null, w: mw, h: mh });
+      let personPx = 0;
+      if (raw) for (let i = 0; i < raw.length; i++) if (raw[i] > 0) personPx++;
+      return { raw, mw, mh, personPx };
+  }
+
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (msg.type !== "mastir-segment-offscreen") return false;
+    (async () => {
+      const { bitmap } = msg.url
+        ? await bitmapFromUrl(msg.url)
+        : await bitmapFromPixels(msg.pixelsB64, msg.w, msg.h);
+      let out = null, used = null;
+      try {
+        // Stop at the first model that finds a person. If none do, keep the
+        // last result so the caller still gets a well-formed (empty) mask.
+        for (const name of MODEL_CHAIN) {
+          const seg = await loadSegmenter(name);
+          out = runModel(seg, MODELS[name].label, bitmap);
+          used = name;
+          if (out.personPx > 0) break;
+        }
+      } finally {
+        bitmap.close();
+      }
+      sendResponse({
+        rawB64: out && out.raw ? bytesToBase64(out.raw) : null,
+        w: out ? out.mw : 0,
+        h: out ? out.mh : 0,
+        model: used,
+      });
     })().catch((e) => {
       console.warn("[mastir/offscreen] segment failed:", e.message);
       sendResponse({ error: e.message });

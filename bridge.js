@@ -33,7 +33,7 @@ window.addEventListener("message", (e) => {
     offscreenReady()
       .then(() => chrome.runtime.sendMessage({ type: "mastir-segment-offscreen", url, pixelsB64, w, h }))
       .then((response) => {
-        window.postMessage({ type: "mastir-segment-response", id, rawB64: response.rawB64, w: response.w, h: response.h, error: response.error }, "*");
+        window.postMessage({ type: "mastir-segment-response", id, rawB64: response.rawB64, w: response.w, h: response.h, model: response.model, error: response.error }, "*");
       })
       .catch((err) => {
         window.postMessage({ type: "mastir-segment-response", id, error: err.message }, "*");
