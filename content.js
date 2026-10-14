@@ -1041,8 +1041,16 @@
       // rules match our overlay too and would otherwise override position/size.
       // Inherit object-fit/position from the element so contain-vs-cover matches
       // and the mask aligns with how the page actually renders the image.
+      // transform:none matters as much as position/size. Themes center an
+      // absolutely-positioned thumbnail with `top:50%; left:50%;
+      // transform: translate(-50%,-50%)` (Elementor's post thumbnails), and
+      // that rule matches our overlay too. Our left/top already describe the
+      // element's VISUAL box (measured from client rects, which include its
+      // transform), so letting the page's translate apply again would shift the
+      // overlay by half its width and height, up and to the left.
       const s = {
         position: "absolute",
+        transform: "none",
         "pointer-events": "none",
         "object-fit": cs.objectFit, "object-position": cs.objectPosition,
         "z-index": "1", filter: "none",
