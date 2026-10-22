@@ -677,6 +677,11 @@
     let best = null;
     for (const attr of el.attributes) {
       if (!attr.value) continue;
+      // An icon/favicon path is metadata ABOUT the element, not the image it
+      // renders — e.g. a log viewer's <div data-favicon-path="/images/failed.png">.
+      // Treating it as the element's image stretches a 32px status icon's mask
+      // across the whole container.
+      if (/icon/i.test(attr.name)) continue;
       for (const cand of attr.value.split(",")) {
         const [url, d] = cand.trim().split(/\s+/);
         if (!url || url.startsWith("data:") || !IMG_URL_ATTR_RE.test(url)) continue;
