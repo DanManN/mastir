@@ -816,7 +816,14 @@
         // a placeholder for a grid photo is laid out large. If it's displayed
         // large, leave it blurred and re-process on load rather than revealing
         // it permanently.
-        if (img.offsetWidth >= 48 && img.offsetHeight >= 48) {
+        // A 0-size box is NOT a small icon — it means the element isn't laid
+        // out yet, so the box proves nothing. Reading "unknown" as "small" is
+        // what revealed Outlook's cid: attachments: they sit at 1x1/0x0 behind
+        // a transparent-GIF placeholder, got markDone'd as tiny, and then
+        // rendered the real 1920x2880 blob: image unblurred for ~700ms until
+        // segmentation caught up. Treat it like the placeholder case instead.
+        if (img.offsetWidth === 0 || img.offsetHeight === 0 ||
+            (img.offsetWidth >= 48 && img.offsetHeight >= 48)) {
           mlog(`[mastir:skip] tiny natural (${img.naturalWidth}x${img.naturalHeight}) but rendered ${img.offsetWidth}x${img.offsetHeight} — placeholder, waiting for load: ${src.slice(0, 90)}`);
           img.addEventListener("load", () => enqueueImage(img), { once: true });
           return;
