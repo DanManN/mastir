@@ -440,6 +440,14 @@
       try { return await decodeToBitmap(fetchUrl); }
       catch (e) { return await bitmapFromElement(el); }
     }
+    // Keep the most informative failure as we fall through. Rung 3 reports a
+    // generic "element not decoded", and for a BACKGROUND element it can't ever
+    // apply (it needs an <img> to draw) — so letting it overwrite the real
+    // reason from rung 1/2 leaves processImage unable to classify the error. It
+    // then treats a permanent failure as transient, retries 5x, gives up, and
+    // leaves the element pre-blurred forever. On a container that blurs every
+    // descendant, i.e. the whole page.
+    let lastErr = null;
     // 1. crossOrigin image load (unblocked by the DNR ACAO rule).
     try {
       const im = new Image();
@@ -449,14 +457,16 @@
         im.onerror = () => reject(new Error("crossOrigin load failed"));
         im.src = fetchUrl;
       });
-    } catch (e) { /* fall through */ }
+    } catch (e) { lastErr = e; }
     // 2. Background fetch (extension context, host-permission CORS bypass).
     try {
       const dataUrl = await crossFetch(fetchUrl);
       return await decodeToBitmap(dataUrl);
-    } catch (e) { /* fall through */ }
-    // 3. Last resort: the live element's own decoded pixels.
-    return bitmapFromElement(el);
+    } catch (e) { lastErr = e; }
+    // 3. Last resort: the live element's own decoded pixels. Only an <img> has
+    // any — for anything else, surface why the fetches actually failed.
+    if (el && el.tagName === "IMG") return bitmapFromElement(el);
+    throw lastErr || new Error("fetch failed");
   }
 
   // Segmentation runs in an offscreen extension page (GPU, own CSP).
@@ -763,6 +773,19 @@
       // Latch permanent blur — applyBlur (runs on every mutation) must not
       // reset this to the revealed state, since we couldn't inspect the image.
       img.__mastirForceBlur = true;
+      // A CSS filter blurs the element's whole SUBTREE, so blurring a container
+      // to hide one unreadable background image takes the entire page with it
+      // (Espresa's <section class="main-body"> has a background photo on S3
+      // that 403s). Drop the background instead: the image we couldn't inspect
+      // is gone entirely — strictly more concealing than blurring it — and the
+      // content inside stays readable. An <img> still blurs, since there the
+      // element IS the image and there's no subtree to lose.
+      if (img.tagName !== "IMG" && img.tagName !== "VIDEO" &&
+          /url\(/.test(getComputedStyle(img).backgroundImage || "")) {
+        img.style.setProperty("background-image", "none", "important");
+        img.style.setProperty("filter", buildFilter(!blurOff), "important");
+        return;
+      }
       img.style.setProperty("filter", MAX_BLUR, "important");
     } else {
       img.style.setProperty("filter", buildFilter(!blurOff), "important");
