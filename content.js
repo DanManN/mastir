@@ -384,7 +384,26 @@
     });
   }
 
+  // Decode a data: URL WITHOUT loading it into an <img>. An <img> load is a
+  // document resource fetch, so it's governed by the page's CSP img-src — and a
+  // policy that omits data: (Amazon's internal pages: `img-src 'self'
+  // *.amazon.com …`) blocks it outright. That killed the whole fetch path:
+  // crossFetch returned the bytes fine, this failed as "decode failed", and
+  // every image fell through to the tainted-canvas dead end. createImageBitmap
+  // on a Blob is a script API, not a resource load, so img-src never applies.
   function decodeToBitmap(src) {
+    if (src.startsWith("data:")) {
+      const comma = src.indexOf(",");
+      if (comma > 0) {
+        const meta = src.slice(5, comma); // e.g. "image/jpeg;base64"
+        const body = src.slice(comma + 1);
+        const mime = meta.split(";")[0] || "image/png";
+        const bytes = /base64/i.test(meta)
+          ? base64ToBytes(body)
+          : new TextEncoder().encode(decodeURIComponent(body));
+        return createImageBitmap(new Blob([bytes], { type: mime }));
+      }
+    }
     return new Promise((resolve, reject) => {
       const im = new Image();
       im.onload = () => resolve(createImageBitmap(im));
@@ -465,7 +484,13 @@
     } catch (e) { lastErr = e; }
     // 3. Last resort: the live element's own decoded pixels. Only an <img> has
     // any — for anything else, surface why the fetches actually failed.
-    if (el && el.tagName === "IMG") return bitmapFromElement(el);
+    if (el && el.tagName === "IMG") {
+      try { return await bitmapFromElement(el); }
+      // Report BOTH reasons. A tainted canvas tells us the element was loaded
+      // credentialed without CORS, but not why fetching it failed — and that's
+      // the half that says whether the image is readable at all.
+      catch (e) { throw lastErr ? new Error(`${e.message} (fetch: ${lastErr.message})`) : e; }
+    }
     throw lastErr || new Error("fetch failed");
   }
 
@@ -947,7 +972,11 @@
       // Unreadable-by-script: give up immediately and KEEP the pre-blur — never
       // reveal an image we couldn't inspect. HTTP 4xx (404/403/410) are dead or
       // forbidden URLs; CORS/decode failures won't change on retry either.
-      if (/CORS|blocked|decode failed|blob load failed|HTTP 4\d\d|context invalidated/i.test(e.message)) {
+      // "tainted" covers Chrome's cross-origin canvas message, which says
+      // "tainted by cross-origin data" and never the word CORS. A tainted
+      // canvas can never become readable, so retrying it just burns 5 attempts
+      // and leaves the image pre-blurred anyway (Midway-authed badge photos).
+      if (/CORS|tainted|blocked|decode failed|blob load failed|HTTP 4\d\d|context invalidated/i.test(e.message)) {
         markDone(img, true, "unreadable:" + e.message.slice(0, 30));
       } else if (/SVG|natural dimensions|createImageBitmap|Assertion/i.test(e.message)) {
         // Benign non-images (SVG/GIF/undecodable vector) — safe to reveal.
@@ -1014,7 +1043,15 @@
   // parent an auto-offset box collapses to the container's content origin, so
   // every overlay in an image grid would stack in the same corner.
   function syncOverlay(el, overlay) {
-    const parent = overlay.parentElement || el.parentElement;
+    // Measure against the overlay's REAL containing block, which is the nearest
+    // POSITIONED ancestor — not necessarily its parent. offsetParent reports it
+    // for us. Assuming the parent was the containing block broke Amazon's
+    // <picture class="mb-ai-picture-wrapper">: it has `display: contents`, so it
+    // generates no box (rect 0x0) and `position` on it is ignored entirely. We
+    // then computed left/top as raw VIEWPORT coordinates while the browser
+    // resolved them against #main-image-container, displacing the overlay by
+    // exactly that container's origin.
+    const parent = overlay.offsetParent || overlay.parentElement || el.parentElement;
     if (!parent) return;
     const er = el.getBoundingClientRect();
     const pr = parent.getBoundingClientRect();
@@ -1027,6 +1064,29 @@
     overlay.style.setProperty("top", `${top}px`, "important");
     overlay.style.setProperty("width", `${er.width}px`, "important");
     overlay.style.setProperty("height", `${er.height}px`, "important");
+    // DIAGNOSTIC: re-measure after layout settles and report any overlay that
+    // drifted. Catches the cases a one-shot sync + ResizeObserver can miss —
+    // measuring while an <img> still renders its alt text (Amazon's
+    // #landingImage starts empty), the element MOVING without resizing, or the
+    // page swapping the <img> out so our observer watches a detached node.
+    // window.mastirLog("drift") lists them.
+    if (MASTIR_PROFILE) {
+      requestAnimationFrame(() => setTimeout(() => {
+        const p = overlay.parentElement;
+        if (!p || !el.isConnected) {
+          mlog(`[mastir:drift] detached id=${el.id || el.className || el.tagName} elConnected=${el.isConnected} ovConnected=${overlay.isConnected}`);
+          return;
+        }
+        const e2 = el.getBoundingClientRect(), p2 = p.getBoundingClientRect();
+        const dx = Math.abs(parseFloat(overlay.style.left) - (e2.left - p2.left));
+        const dy = Math.abs(parseFloat(overlay.style.top) - (e2.top - p2.top));
+        const dw = Math.abs(parseFloat(overlay.style.width) - e2.width);
+        const dh = Math.abs(parseFloat(overlay.style.height) - e2.height);
+        if (dx > 2 || dy > 2 || dw > 2 || dh > 2) {
+          mlog(`[mastir:drift] ${el.id || el.className || el.tagName} off by ${dx.toFixed(0)},${dy.toFixed(0)} size ${dw.toFixed(0)}x${dh.toFixed(0)} — set=${overlay.style.left},${overlay.style.top} ${overlay.style.width}x${overlay.style.height} now=${(e2.left - p2.left).toFixed(0)},${(e2.top - p2.top).toFixed(0)} ${e2.width.toFixed(0)}x${e2.height.toFixed(0)} box=${el.offsetWidth}x${el.offsetHeight} nat=${el.naturalWidth}x${el.naturalHeight} complete=${el.complete} sibling=${el.nextElementSibling === overlay} parent=${p.tagName}`);
+        }
+      }, 500));
+    }
   }
 
   function paintOverlay(el, dataUrl) {
@@ -1091,12 +1151,16 @@
         "z-index": "1", filter: "none",
       };
       for (const [k, v] of Object.entries(s)) overlay.style.setProperty(k, v, "important");
-      syncOverlay(el, overlay);
       el.__mastirOverlay = overlay;
+      // Insert BEFORE the first sync: syncOverlay measures against
+      // overlay.offsetParent, which is null until the overlay is in the
+      // document — and falling back to the parent is exactly the wrong frame
+      // when the parent generates no box (display: contents).
+      parent.insertBefore(overlay, el.nextSibling);
+      syncOverlay(el, overlay);
       // Re-sync the overlay to the element's box whenever it reflows (responsive
       // breakpoints, window resize). Absolute positioning doesn't track flow.
       new ResizeObserver(() => syncOverlay(el, overlay)).observe(el);
-      parent.insertBefore(overlay, el.nextSibling);
     }
     if (overlay instanceof SVGImageElement) overlay.setAttribute("href", dataUrl);
     else overlay.src = dataUrl;
