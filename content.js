@@ -1070,20 +1070,22 @@
     // #landingImage starts empty), the element MOVING without resizing, or the
     // page swapping the <img> out so our observer watches a detached node.
     // window.mastirLog("drift") lists them.
+    // Compare the overlay's RENDERED rect to the element's, never a recomputed
+    // offset. Both rects are in viewport space, so this is independent of which
+    // ancestor is the containing block — which is the whole point: a check that
+    // re-ran the same left/top formula agreed with itself and happily reported
+    // zero drift while the overlay sat a whole container's origin away.
     if (MASTIR_PROFILE) {
       requestAnimationFrame(() => setTimeout(() => {
-        const p = overlay.parentElement;
-        if (!p || !el.isConnected) {
+        if (!el.isConnected || !overlay.isConnected) {
           mlog(`[mastir:drift] detached id=${el.id || el.className || el.tagName} elConnected=${el.isConnected} ovConnected=${overlay.isConnected}`);
           return;
         }
-        const e2 = el.getBoundingClientRect(), p2 = p.getBoundingClientRect();
-        const dx = Math.abs(parseFloat(overlay.style.left) - (e2.left - p2.left));
-        const dy = Math.abs(parseFloat(overlay.style.top) - (e2.top - p2.top));
-        const dw = Math.abs(parseFloat(overlay.style.width) - e2.width);
-        const dh = Math.abs(parseFloat(overlay.style.height) - e2.height);
+        const e2 = el.getBoundingClientRect(), o2 = overlay.getBoundingClientRect();
+        const dx = Math.abs(o2.left - e2.left), dy = Math.abs(o2.top - e2.top);
+        const dw = Math.abs(o2.width - e2.width), dh = Math.abs(o2.height - e2.height);
         if (dx > 2 || dy > 2 || dw > 2 || dh > 2) {
-          mlog(`[mastir:drift] ${el.id || el.className || el.tagName} off by ${dx.toFixed(0)},${dy.toFixed(0)} size ${dw.toFixed(0)}x${dh.toFixed(0)} — set=${overlay.style.left},${overlay.style.top} ${overlay.style.width}x${overlay.style.height} now=${(e2.left - p2.left).toFixed(0)},${(e2.top - p2.top).toFixed(0)} ${e2.width.toFixed(0)}x${e2.height.toFixed(0)} box=${el.offsetWidth}x${el.offsetHeight} nat=${el.naturalWidth}x${el.naturalHeight} complete=${el.complete} sibling=${el.nextElementSibling === overlay} parent=${p.tagName}`);
+          mlog(`[mastir:drift] ${el.id || el.className || el.tagName} off by ${dx.toFixed(0)},${dy.toFixed(0)} size ${dw.toFixed(0)}x${dh.toFixed(0)} — el=${e2.left.toFixed(0)},${e2.top.toFixed(0)} ${e2.width.toFixed(0)}x${e2.height.toFixed(0)} ov=${o2.left.toFixed(0)},${o2.top.toFixed(0)} ${o2.width.toFixed(0)}x${o2.height.toFixed(0)} set=${overlay.style.left},${overlay.style.top} cb=${overlay.offsetParent ? (overlay.offsetParent.id || overlay.offsetParent.tagName) : "(none)"} nat=${el.naturalWidth}x${el.naturalHeight} complete=${el.complete} sibling=${el.nextElementSibling === overlay}`);
         }
       }, 500));
     }
