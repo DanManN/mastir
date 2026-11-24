@@ -9,8 +9,9 @@
 const MAX_SEG_DIM = 256;
 
 // --- Model configuration ---------------------------------------------------
-// Which models run, and in what order, is set by MODEL_CHAIN below. Each entry describes its
-// asset and how to interpret the category mask into "person" pixels:
+// Which models run, and in what order, is set from the popup's Advanced
+// settings (see modelChain below). Each entry here describes its asset and how
+// to interpret the category mask into "person" pixels:
 //   isPerson(category) -> true if that class index counts as a person.
 //
 // selfie_multiclass_256x256: 6 classes, everything non-background (>0) is the
@@ -48,12 +49,35 @@ const MODELS = {
   },
 };
 // Models to try, in order, until one finds a person. Each entry is a key of
-// MODELS above. Edit this list to change which models run and in what order;
-// a single-element list pins one model. Falling back only costs extra
-// inference when a model finds NOTHING — the case we'd otherwise lose — so
-// images that the first model handles pay nothing. Models load lazily, so
+// MODELS above; a single-element chain pins one model. Falling back only costs
+// extra inference when a model finds NOTHING — the case we'd otherwise lose —
+// so images that the first model handles pay nothing. Models load lazily, so
 // later entries cost no memory until something actually misses.
-const MODEL_CHAIN = ["selfie", "selfieBinary", "landscape"];
+//
+// The popup's Advanced settings own this at runtime: the config is stored as
+// chrome.storage.local `modelChain` (an ordered [{ key, on }]) and arrives
+// WITH each segment request. This list is the fallback for a request that
+// carries no usable chain. Keep it in sync with DEFAULT_CHAIN in popup.js.
+//
+// It's bridge.js that reads storage, not this file: an offscreen document may
+// only use chrome.runtime APIs. chrome.storage is undefined here, so touching
+// it throws at load and takes the whole script — including the onMessage
+// listener at the bottom — with it, which silently stops ALL segmentation and
+// leaves every image on every page stuck behind its pre-blur.
+const DEFAULT_CHAIN = ["selfie", "selfieBinary", "landscape"];
+
+// Reduce that config to an ordered list of runnable model keys. Unknown keys
+// are dropped, so a model deleted from MODELS can't break segmentation. The
+// result is never empty: an empty chain would stop concealing every image on
+// every page, which is the one failure this must not allow — the popup already
+// refuses to turn the last model off, and this is the backstop for a config
+// that's stale, hand-edited, or corrupt.
+function readChain(stored) {
+  const keys = Array.isArray(stored)
+    ? stored.filter((m) => m && m.on && MODELS[m.key]).map((m) => m.key)
+    : [];
+  return keys.length ? keys : DEFAULT_CHAIN;
+}
 
 const segmenters = new Map();  // name -> ImageSegmenter
 const segLoading = new Map();  // name -> in-flight load promise
@@ -167,18 +191,34 @@ function bytesToBase64(bytes) {
         ? await bitmapFromUrl(msg.url)
         : await bitmapFromPixels(msg.pixelsB64, msg.w, msg.h);
       let out = null, used = null;
+      const failed = [];
       try {
         // Stop at the first model that finds a person. If none do, keep the
         // last result so the caller still gets a well-formed (empty) mask.
-        for (const name of MODEL_CHAIN) {
-          const seg = await loadSegmenter(name);
-          out = runModel(seg, MODELS[name].label, bitmap);
-          used = name;
+        for (const name of readChain(msg.modelChain)) {
+          // Isolate each model. The chain is user-ordered from the popup now,
+          // so an entry that can't load (missing asset, delegate unsupported)
+          // is reachable in a way it wasn't when the chain was hardcoded —
+          // and letting it throw out of the loop would fail EVERY image on
+          // every page, leaving the whole web pre-blurred. Skip it instead.
+          try {
+            const seg = await loadSegmenter(name);
+            out = runModel(seg, MODELS[name].label, bitmap);
+            used = name;
+          } catch (e) {
+            failed.push(`${name}: ${e.message}`);
+            console.warn(`[mastir/offscreen] model ${name} unusable, skipping:`, e.message);
+            continue;
+          }
           if (out.personPx > 0) break;
         }
       } finally {
         bitmap.close();
       }
+      // Nothing ran: report an error, never an empty mask. An empty mask means
+      // "no person in this image" and makes the caller REVEAL it, so a
+      // chain-wide failure has to fail closed and leave the pre-blur on.
+      if (!out) throw new Error(`no usable model (${failed.join("; ") || "empty chain"})`);
       sendResponse({
         rawB64: out && out.raw ? bytesToBase64(out.raw) : null,
         w: out ? out.mw : 0,

@@ -1,6 +1,10 @@
 <!DOCTYPE html>
 <html>
 <head>
+<!-- Required: a <script src> with no charset of its own inherits the
+     document's encoding, so without this popup.js is decoded as windows-1252
+     and its non-ASCII characters (the ▲/▼ arrow glyphs) come out as mojibake. -->
+<meta charset="utf-8">
 <style>
   body { width: 280px; padding: 12px; font-family: sans-serif; font-size: 13px; color: #333; }
   h3 { margin: 0 0 12px; font-size: 15px; }
@@ -9,6 +13,13 @@
   input[type="range"] { width: 100%; }
   .toggle { cursor: pointer; padding: 6px 10px; background: #555; color: #fff; border-radius: 4px; text-align: center; }
   .toggle.active { background: #047c9d; }
+  details { border-top: 1px solid #ddd; padding-top: 8px; }
+  summary { cursor: pointer; font-size: 13px; font-weight: 600; }
+  .hint { color: #777; font-size: 11px; line-height: 1.4; margin: 8px 0; }
+  .model { display: grid; grid-template-columns: 1fr 26px 26px; gap: 4px; margin-bottom: 4px; }
+  .model .arrow { cursor: pointer; background: #eee; color: #555; border-radius: 4px; text-align: center; padding: 6px 0; font-size: 10px; }
+  .model .arrow.off { opacity: 0.3; cursor: default; }
+  .model .locked { cursor: default; }
 </style>
 </head>
 <body>
@@ -23,6 +34,12 @@
   <label>Mask expand: <input type="range" id="mask-expand-slider" min="0" max="32" value="8"> <span id="mask-expand-val">8</span></label>
   <div class="toggle" id="skin-toggle" style="margin-top: 8px;">Skin Only: Off</div>
 </div>
+<details>
+  <summary>Advanced settings</summary>
+  <div class="hint">Models, tried top-down until one finds a person. Click to
+    toggle, arrows to reorder. Reload a page to re-segment it.</div>
+  <div id="model-list"></div>
+</details>
 <script src="popup.js"></script>
 </body>
 </html>

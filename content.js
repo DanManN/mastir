@@ -118,6 +118,28 @@
     return false;
   }
 
+  // An image url parked in a CSS custom property, e.g. MakerWorld's swiper
+  // slides (`--before-img: url(photo.png)`, painted by a ::before). shouldPreBlur
+  // already blurs such an element — it matches BG_IMG_RE against the whole style
+  // attribute — so the resolve side MUST see the same url, or nothing ever lifts
+  // the blur and the element (plus its entire subtree, since filter paints the
+  // subtree) stays concealed forever, even though the real <img> inside it was
+  // segmented and revealed. Returns the url and the property holding it:
+  // overwriting that property is how we repaint, and it works regardless of
+  // whether the var feeds background-image, content, or mask-image — a
+  // pseudo-element takes no inline style, so there's nothing else to write.
+  function customPropImageUrl(el) {
+    const style = el.style;
+    for (let i = 0; i < style.length; i++) {
+      const prop = style[i];
+      if (!prop.startsWith("--")) continue;
+      const m = style.getPropertyValue(prop).match(BG_IMG_RE);
+      // Same spacer/placeholder exclusion as shouldPreBlur.
+      if (m && !(m[1].startsWith("data:") && m[1].length < 256)) return { url: m[1], varName: prop };
+    }
+    return null;
+  }
+
   function blurElement(el) {
     el.style.setProperty("filter", MAX_BLUR, "important");
     // Don't set clip-path on an SVG <image>: inline style overrides its
@@ -772,6 +794,9 @@
       const match = bg.match(/url\(["']?([^"')]+)["']?\)/);
       if (match) return match[1];
     }
+    // A url() held in a CSS custom property and rendered by a pseudo-element.
+    const customProp = customPropImageUrl(el);
+    if (customProp) return customProp.url;
     // Generic scan of every attribute for an image URL — covers custom-element
     // src attributes AND lazy-load plugins (data-lazy-src/-srcset, data-src),
     // picking the largest srcset variant and resolving relative URLs.
@@ -808,6 +833,13 @@
       if (img.tagName !== "IMG" && img.tagName !== "VIDEO" &&
           /url\(/.test(getComputedStyle(img).backgroundImage || "")) {
         img.style.setProperty("background-image", "none", "important");
+        img.style.setProperty("filter", buildFilter(!blurOff), "important");
+        return;
+      }
+      // Same reasoning for an image held in a custom property: drop the url
+      // rather than blurring the element and everything inside it.
+      if (img.__mastirBgVar) {
+        img.style.setProperty(img.__mastirBgVar, "none", "important");
         img.style.setProperty("filter", buildFilter(!blurOff), "important");
         return;
       }
@@ -1181,7 +1213,9 @@
         const el = m.target;
         const painted = el.__mastirPaintedBg;
         if (!painted) continue;
-        if ((el.style.backgroundImage || "").includes(painted)) continue; // still ours
+        // Check the whole inline style, not just background-image: the mask may
+        // have been painted into a CSS custom property instead (see applyMask).
+        if ((el.style.cssText || "").includes(painted)) continue; // still ours
         applyMask(el);
       }
     });
@@ -1277,6 +1311,14 @@
           selfUpdating = false;
         } else if (img.tagName === "VIDEO") {
           img.setAttribute("poster", dataUrl);
+        } else if (img.__mastirBgVar) {
+          // The image comes from a CSS custom property consumed by a
+          // pseudo-element. Overwrite the property: whatever renders it
+          // (background-image, content, mask) picks up the masked version,
+          // and a pseudo-element has no inline style of its own to target.
+          img.style.setProperty(img.__mastirBgVar, `url(${dataUrl})`, "important");
+          img.__mastirPaintedBg = dataUrl;
+          bgReapplyObserver.observe(img, { attributes: true, attributeFilter: ["style"] });
         } else {
           // Background may layer gradients over the image url(); swap only the
           // url() so any decorative gradient tint is preserved.
@@ -1387,6 +1429,14 @@
     const bg = getComputedStyle(el).backgroundImage;
     const match = bg && bg !== "none" ? bg.match(/url\(["']?([^"')]+)["']?\)/) : null;
     let url = match ? match[1] : null;
+    // A url() in a custom property, painted by a pseudo-element. Checked before
+    // the child-<img> guard below: an inline `--x: url(photo.png)` is an explicit
+    // declaration that this element renders that image, so it holds even when a
+    // real <img> also sits inside (MakerWorld's swiper slides are exactly that).
+    if (!url) {
+      const customProp = customPropImageUrl(el);
+      if (customProp) { url = customProp.url; el.__mastirBgVar = customProp.varName; }
+    }
     // Only fall back to an attribute-stored URL (data-png, landscape-src,
     // etc.) when the element ISN'T just a container around a real <img>.
     // Grid cells like flaticon's <li data-png="…512/….png"> hold the icon
@@ -1408,8 +1458,11 @@
     }
     if (/\.(svg|gif)(\?|$)/i.test(url)) return true;
     // Custom elements that render their image in shadow DOM can't be
-    // repainted via a host background — flag them for an overlay.
-    if (!match) el.__mastirOverlayPaint = true;
+    // repainted via a host background — flag them for an overlay. A custom
+    // property is excluded: we CAN repaint it (applyMask overwrites the
+    // property), and an overlay would be wrong anyway — it would cover the
+    // element's real children, including the <img> we segment separately.
+    if (!match && !el.__mastirBgVar) el.__mastirOverlayPaint = true;
     blurElement(el);
     enqueueImage(el);
     return true;
